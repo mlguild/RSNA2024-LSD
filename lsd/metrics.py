@@ -46,9 +46,7 @@ def score(
         raise ParticipantVisibleError("All predictions must be at least zero")
 
     solution["study_id"] = solution["row_id"].apply(lambda x: x.split("_")[0])
-    solution["location"] = solution["row_id"].apply(
-        lambda x: "_".join(x.split("_")[1:])
-    )
+    solution["location"] = solution["row_id"].apply(lambda x: "_".join(x.split("_")[1:]))
     solution["condition"] = solution["row_id"].apply(get_condition)
 
     del solution[row_id_column_name]
@@ -62,33 +60,23 @@ def score(
     condition_losses = []
     condition_weights = []
     for condition in ["spinal", "foraminal", "subarticular"]:
-        condition_indices = solution.loc[
-            solution["condition"] == condition
-        ].index.values
+        condition_indices = solution.loc[solution["condition"] == condition].index.values
         condition_loss = sklearn.metrics.log_loss(
             y_true=solution.loc[condition_indices, target_levels].values,
             y_pred=submission.loc[condition_indices, target_levels].values,
-            sample_weight=solution.loc[
-                condition_indices, "sample_weight"
-            ].values,
+            sample_weight=solution.loc[condition_indices, "sample_weight"].values,
         )
         condition_losses.append(condition_loss)
         condition_weights.append(1)
 
     any_severe_spinal_labels = pd.Series(
-        solution.loc[solution["condition"] == "spinal"]
-        .groupby("study_id")["severe"]
-        .max()
+        solution.loc[solution["condition"] == "spinal"].groupby("study_id")["severe"].max()
     )
     any_severe_spinal_weights = pd.Series(
-        solution.loc[solution["condition"] == "spinal"]
-        .groupby("study_id")["sample_weight"]
-        .max()
+        solution.loc[solution["condition"] == "spinal"].groupby("study_id")["sample_weight"].max()
     )
     any_severe_spinal_predictions = pd.Series(
-        submission.loc[submission["condition"] == "spinal"]
-        .groupby("study_id")["severe"]
-        .max()
+        submission.loc[submission["condition"] == "spinal"].groupby("study_id")["severe"].max()
     )
     any_severe_spinal_loss = sklearn.metrics.log_loss(
         y_true=any_severe_spinal_labels,
