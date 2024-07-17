@@ -1,0 +1,29 @@
+[project]
+name = "lsd"
+description = "A package for the mlguild submission to the RSNA2024 LSD Kaggle competition"
+version = "0.1.0"
+authors = [
+    {name = "Marina Potsi", email = "potsimarina@gmail.com"},
+    {name = "Andreas Grivas", email = "andreasgrv@gmail.com"},
+    {name = "Mansour Sami", email = "this.is.mansoursami@gmail.com"},
+    {name = "Antreas Antoniou", email = "iam@antreas.io"},
+]
+dependencies = [
+    "rich",
+    "pandas",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "numpy",
+]
+
+# pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cpu
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pre-commit",
+    "bump2version",
+    "black",
+    "isort",
+]
