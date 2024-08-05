@@ -1,3 +1,4 @@
+from collections import defaultdict
 import pathlib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -259,9 +260,17 @@ if __name__ == "__main__":
     # print(metadata.columns)
 
     tmp_data_dir = "/mnt/nvme-fast0/datasets/"
-    dataset = ISIC2024Dataset(root_dir=tmp_data_dir)
-    print(dataset)
+    from gate.data.image.classification.imagenet1k import StandardAugmentations
+    from tqdm.auto import tqdm
 
-    for item in dataset:
-        print(item)
-        break
+    transforms = [StandardAugmentations()]
+    dataset = ISIC2024Dataset(root_dir=tmp_data_dir)
+
+    print(dataset)
+    image_size_freq = defaultdict(int)
+    for item in tqdm(dataset):
+        # print(item)
+        image_size = item.image.size
+        image_size_freq[image_size] += 1
+
+    print(image_size_freq)
