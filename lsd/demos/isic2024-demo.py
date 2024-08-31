@@ -1,11 +1,13 @@
-import pandas as pd
 import gradio as gr
-import numpy as np
-import os
+import pandas as pd
 
 # Define paths for both train and test metadata
-train_csv_path = "/mnt/nvme-fast0/datasets/isic-2024-challenge/train-metadata.csv"
-test_csv_path = "/mnt/nvme-fast0/datasets/isic-2024-challenge/test-metadata.csv"
+train_csv_path = (
+    "/mnt/nvme-fast0/datasets/isic-2024-challenge/train-metadata.csv"
+)
+test_csv_path = (
+    "/mnt/nvme-fast0/datasets/isic-2024-challenge/test-metadata.csv"
+)
 
 # Load both datasets
 train_metadata = pd.read_csv(train_csv_path)
@@ -26,7 +28,9 @@ with gr.Blocks(theme="huggingface") as iface:
     )
 
     with gr.Row():
-        dataset_choice = gr.Dropdown(["Train", "Test"], label="Select Dataset", value="Train")
+        dataset_choice = gr.Dropdown(
+            ["Train", "Test"], label="Select Dataset", value="Train"
+        )
         num_rows = gr.Slider(
             1,
             max(len(train_metadata), len(test_metadata)),
@@ -40,8 +44,12 @@ with gr.Blocks(theme="huggingface") as iface:
     def update_table(dataset, num_rows):
         return view_dataframe(dataset, num_rows)
 
-    dataset_choice.change(update_table, inputs=[dataset_choice, num_rows], outputs=output_table)
-    num_rows.change(update_table, inputs=[dataset_choice, num_rows], outputs=output_table)
+    dataset_choice.change(
+        update_table, inputs=[dataset_choice, num_rows], outputs=output_table
+    )
+    num_rows.change(
+        update_table, inputs=[dataset_choice, num_rows], outputs=output_table
+    )
 
 if __name__ == "__main__":
     iface.launch(share=True, debug=True)

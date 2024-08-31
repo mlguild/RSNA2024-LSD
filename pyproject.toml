@@ -17,15 +17,72 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "kaggle",
+    "torchgeometry",
+    "torchmetrics",
+    "accelerate",
+    "transformers",
+    "monai",
+    "h5py",
+    "datasets",
+    "huggingface_hub",
+    "orjson",
+    "hydra-zen",
+    "torchtyping",
+    "wandb",
+    "opencv-python",
+    "scipy",
+    "decord",
+    "natsort",
+    "einops",
+    "fire",
+    "timm",
+    "plotly",
+    "pdm",
 ]
-
-# pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cpu
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-rich",
+    "pytest-sugar",
+    "pytest-xdist",
+    "autoflake",
+    "isort",
+    "black",
+    "jupyterlab",
+    "nvitop",
+    "gh",
+    "sphinx",
+    "sphinx_rtd_theme",
+    "sphinx-autodoc-typehints",
+    "sphinx-material",
+    "matplotlib",
     "pre-commit",
     "bump2version",
-    "black",
-    "isort",
 ]
+
+[tool.pdm.scripts]
+lint = {composite = [
+    "pdm run isort -c lsd/",
+    "pdm run black --check . lsd/",
+    "pdm run autoflake --check --recursive --remove-all-unused-imports --remove-unused-variables --ignore-init-module-imports lsd/"
+]}
+format = {composite = [
+    "pdm run isort lsd/",
+    "pdm run black lsd/",
+    "pdm run autoflake --in-place --recursive --remove-all-unused-imports --remove-unused-variables --ignore-init-module-imports lsd/"
+]}
+
+[tool.isort]
+profile = "black"
+line_length = 79
+
+[tool.black]
+line-length = 79
+
+[tool.autoflake]
+remove-all-unused-imports = true
+remove-unused-variables = true
+ignore-init-module-imports = true

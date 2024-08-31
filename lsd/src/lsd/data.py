@@ -1,18 +1,17 @@
-from collections import defaultdict
+import io
 import pathlib
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from enum import StrEnum
-from re import split
 from typing import Any, Callable, Dict, Optional
 
 import h5py
 import pandas as pd
 import PIL.Image
-from gate.data import download_kaggle_dataset, unzip_file
+from gate.data import download_kaggle_dataset
 from rich import print
 from rich.traceback import install
-from torch.utils.data import DataLoader, Dataset
-import io
+from torch.utils.data import Dataset
 
 install()
 
@@ -90,7 +89,9 @@ class Importance:
     HIGH = 1  # should be used in first string of experiments, MUST HAVEs
     MEDIUM = 2  # could offer additional modelling power, to be used in later experiments, MAY HAVEs
     LOW = 3  # unlikely to offer additional modelling power, to be used in later experiments, ???
-    VERY_LOW = 4  # very unlikely to offer additional modelling power, not be used
+    VERY_LOW = (
+        4  # very unlikely to offer additional modelling power, not be used
+    )
 
 
 METADATA_KEYS_TO_USE = [
@@ -129,7 +130,9 @@ METADATA_KEYS_TO_USE = [
     MetadataInfo(name="tbp_lv_norm_border", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_norm_color", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_perimeterMM", importance=Importance.MEDIUM),
-    MetadataInfo(name="tbp_lv_radial_color_std_max", importance=Importance.MEDIUM),
+    MetadataInfo(
+        name="tbp_lv_radial_color_std_max", importance=Importance.MEDIUM
+    ),
     MetadataInfo(name="tbp_lv_stdL", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_stdLExt", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_symm_2axis", importance=Importance.MEDIUM),
@@ -141,7 +144,9 @@ METADATA_KEYS_TO_USE = [
     MetadataInfo(name="copyright_license", importance=Importance.VERY_LOW),
     MetadataInfo(name="iddx_full", importance=Importance.HIGH),
     MetadataInfo(name="iddx_1", importance=Importance.MEDIUM),
-    MetadataInfo(name="tbp_lv_dnn_lesion_confidence", importance=Importance.HIGH),
+    MetadataInfo(
+        name="tbp_lv_dnn_lesion_confidence", importance=Importance.HIGH
+    ),
 ]
 
 
@@ -162,6 +167,7 @@ class ISIC2024Dataset(Dataset):
         split_name: SplitNames | str = SplitNames.TRAIN,
         transform: Optional[Callable] = None,
         importance_level_labels: Importance = Importance.HIGH,
+        return_samples_as_dict: bool = False,
     ):
         super().__init__()
         if isinstance(root_dir, str):
@@ -171,26 +177,41 @@ class ISIC2024Dataset(Dataset):
         self.transform = transform
         self.download_extract_data()
         self.file_count_after_download_and_extract = ISIC2024_COUNT
+        self.return_samples_as_dict = return_samples_as_dict
 
         if split_name == SplitNames.TRAIN or split_name == SplitNames.VAL:
             target_split_name = "train"
-            self.data = self.root_dir / DatasetNames.ISIC_2024 / f"{target_split_name}-image.hdf5"
+            self.data = (
+                self.root_dir
+                / DatasetNames.ISIC_2024
+                / f"{target_split_name}-image.hdf5"
+            )
             self.data = h5py.File(self.data, "r")
             self.metadata_path = (
-                self.root_dir / DatasetNames.ISIC_2024 / f"{target_split_name}-metadata.csv"
+                self.root_dir
+                / DatasetNames.ISIC_2024
+                / f"{target_split_name}-metadata.csv"
             )
             self.metadata = pd.read_csv(self.metadata_path)
         elif split_name == SplitNames.TEST:
             target_split_name = "test"
-            self.data = self.root_dir / DatasetNames.ISIC_2024 / f"{target_split_name}-image.hdf5"
+            self.data = (
+                self.root_dir
+                / DatasetNames.ISIC_2024
+                / f"{target_split_name}-image.hdf5"
+            )
             self.data = h5py.File(self.data, "r")
             self.metadata_path = (
-                self.root_dir / DatasetNames.ISIC_2024 / f"{target_split_name}-metadata.csv"
+                self.root_dir
+                / DatasetNames.ISIC_2024
+                / f"{target_split_name}-metadata.csv"
             )
             self.metadata = pd.read_csv(self.metadata_path)
 
         self.label_keys_to_use = [
-            item.name for item in METADATA_KEYS_TO_USE if item.importance <= importance_level_labels
+            item.name
+            for item in METADATA_KEYS_TO_USE
+            if item.importance <= importance_level_labels
         ]
 
     def download_extract_data(self):
@@ -210,14 +231,20 @@ class ISIC2024Dataset(Dataset):
 
     def __getitem__(self, idx):
 
-        labels = {key: self.metadata.iloc[idx][key] for key in self.label_keys_to_use}
+        labels = {
+            key: self.metadata.iloc[idx][key] for key in self.label_keys_to_use
+        }
         image_bytes = self.data[labels[ISIC_ID]][()]
         image = PIL.Image.open(io.BytesIO(image_bytes))
 
         if self.transform:
             image = self.transform(image)
 
-        return DataItem(image=image, labels=labels)
+        output = DataItem(image=image, labels=labels)
+
+        if self.return_samples_as_dict:
+            output = asdict(output)
+        return output
 
 
 if __name__ == "__main__":
@@ -262,15 +289,25 @@ if __name__ == "__main__":
     tmp_data_dir = "/mnt/nvme-fast0/datasets/"
     from gate.data.image.classification.imagenet1k import StandardAugmentations
     from tqdm.auto import tqdm
+    import torchvision.transforms as T
+    from torch.utils.data import DataLoader
 
-    transforms = [StandardAugmentations()]
-    dataset = ISIC2024Dataset(root_dir=tmp_data_dir)
-
-    print(dataset)
+    transforms = [T.Resize(224), StandardAugmentations(), T.ToTensor()]
+    dataset = ISIC2024Dataset(
+        root_dir=tmp_data_dir,
+        transform=T.Compose(transforms),
+        return_samples_as_dict=True,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1024,
+        shuffle=True,
+        num_workers=16,
+        pin_memory=True,
+    )
     image_size_freq = defaultdict(int)
-    for item in tqdm(dataset):
-        # print(item)
-        image_size = item.image.size
-        image_size_freq[image_size] += 1
-
-    print(image_size_freq)
+    label_frequencies = defaultdict(int)
+    for item in tqdm(dataloader):
+        for label in item["labels"]["target"]:
+            label_frequencies[int(label)] += 1
+        print(label_frequencies)
