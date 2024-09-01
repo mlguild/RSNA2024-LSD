@@ -1,6 +1,9 @@
 import concurrent.futures
 import io
+import json
+import hashlib
 import multiprocessing as mp
+import os
 import pathlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -168,6 +171,9 @@ class ISIC2024Dataset(Dataset):
         transform: Optional[Callable] = None,
         importance_level_labels: Importance = Importance.HIGH,
         return_samples_as_dict: bool = False,
+        val_ratio: float = 0.05,
+        dev_ratio: float = 0.05,
+        seed: int = 42,
     ):
         super().__init__()
         if isinstance(root_dir, str):
@@ -175,11 +181,14 @@ class ISIC2024Dataset(Dataset):
 
         self.root_dir = root_dir
         self.transform = transform
-        self.download_extract_data()
-        self.file_count_after_download_and_extract = ISIC2024_COUNT
+        self.split_name = split_name
+        self.val_ratio = val_ratio
+        self.dev_ratio = dev_ratio
+        self.seed = seed
         self.return_samples_as_dict = return_samples_as_dict
 
-        self.split_name = split_name
+        self.download_extract_data()
+        self.file_count_after_download_and_extract = ISIC2024_COUNT
 
         if split_name in {
             SplitNames.TRAIN,
@@ -218,7 +227,6 @@ class ISIC2024Dataset(Dataset):
             if item.importance <= importance_level_labels
         ]
 
-        # Check if 'target' is available in the metadata
         self.has_targets = "target" in self.metadata.columns
 
         if self.has_targets:
@@ -230,16 +238,20 @@ class ISIC2024Dataset(Dataset):
 
     def _split_metadata(self):
         """Split the training metadata into train, val, and devtest"""
-        train_ratio, val_ratio, devtest_ratio = 0.5, 0.10, 0.40
+        train_ratio = 1 - self.val_ratio - self.dev_ratio
         train_end = int(train_ratio * len(self.metadata))
-        val_end = int((train_ratio + val_ratio) * len(self.metadata))
+        val_end = int((train_ratio + self.val_ratio) * len(self.metadata))
+
+        # Set seed for reproducibility
+        np.random.seed(self.seed)
+        shuffled_metadata = self.metadata.sample(frac=1).reset_index(drop=True)
 
         if self.split_name == SplitNames.TRAIN:
-            return self.metadata[:train_end]
+            return shuffled_metadata[:train_end]
         elif self.split_name == SplitNames.VAL:
-            return self.metadata[train_end:val_end]
+            return shuffled_metadata[train_end:val_end]
         elif self.split_name == SplitNames.DEVTEST:
-            return self.metadata[val_end:]
+            return shuffled_metadata[val_end:]
         else:
             raise ValueError(
                 f"Invalid split name for splitting metadata: {self.split_name}"
@@ -249,6 +261,19 @@ class ISIC2024Dataset(Dataset):
         if not self.has_targets:
             return None
 
+        # Create a unique identifier for this dataset configuration
+        config_str = (
+            f"{self.split_name}_{self.val_ratio}_{self.dev_ratio}_{self.seed}"
+        )
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()
+        cache_file = self.root_dir / f"class_indices_cache_{config_hash}.json"
+
+        if cache_file.exists():
+            print("Loading class indices from cache...")
+            with open(cache_file, "r") as f:
+                return {int(k): v for k, v in json.load(f).items()}
+
+        print("Computing class indices...")
         class_indices = defaultdict(list)
 
         def process_row(args):
@@ -270,6 +295,10 @@ class ISIC2024Dataset(Dataset):
             ):
                 target, idx = future.result()
                 class_indices[target].append(idx)
+
+        # Save to cache
+        with open(cache_file, "w") as f:
+            json.dump(class_indices, f)
 
         return class_indices
 
@@ -420,6 +449,9 @@ def main():
         split_name=SplitNames.TRAIN,
         transform=T.Compose(transforms),
         return_samples_as_dict=True,
+        val_ratio=0.10,
+        dev_ratio=0.10,
+        seed=42,
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
@@ -459,6 +491,35 @@ def main():
 
         print(f"Batch {i+1} label frequencies: {dict(label_frequencies)}")
         label_frequencies.clear()  # Reset for next batch
+
+    # Load validation dataset
+    val_transforms = [
+        T.Resize(224),
+        T.ToTensor(),
+    ]  # No augmentations for validation set
+    val_dataset = ISIC2024Dataset(
+        root_dir=tmp_data_dir,
+        split_name=SplitNames.VAL,
+        transform=T.Compose(val_transforms),
+        return_samples_as_dict=True,
+        val_ratio=0.10,
+        dev_ratio=0.10,
+        seed=42,
+    )
+
+    print(f"\nValidation dataset size: {len(val_dataset)}")
+    print("Validation class distribution:")
+    for class_idx, indices in val_dataset.class_indices.items():
+        print(f"Class {class_idx}: {len(indices)} samples")
+
+    # Create a simple dataloader for the validation dataset (no balanced sampling)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+    )
 
     # Load test dataset
     test_transforms = [

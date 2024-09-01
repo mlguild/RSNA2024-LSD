@@ -486,17 +486,12 @@ def compute_metrics(
             # Compute overall metrics
             auc_roc = roc_auc_score(labels, probabilities)
             pauc = compute_pauc_above_80_tpr(labels, probabilities)
-            precision, recall, _ = precision_recall_curve(
-                labels, probabilities
-            )
-            f1_scores = f1_score(labels, predictions)
             ap = average_precision_score(labels, probabilities)
 
             metrics.update(
                 {
                     "auc_roc": auc_roc,
                     "pauc_above_80_tpr": pauc,
-                    "f1_score": f1_scores,
                     "average_precision": ap,
                 }
             )
@@ -504,27 +499,14 @@ def compute_metrics(
             # Compute per-class metrics
             for class_id in range(2):  # Assuming binary classification
                 class_mask = labels == class_id
-                class_probabilities = probabilities[class_mask]
                 class_labels = labels[class_mask]
                 class_predictions = predictions[class_mask]
 
                 class_accuracy = (class_predictions == class_labels).mean()
-                class_precision = precision_score(
-                    class_labels, class_predictions, average="binary"
-                )
-                class_recall = recall_score(
-                    class_labels, class_predictions, average="binary"
-                )
-                class_f1 = f1_score(
-                    class_labels, class_predictions, average="binary"
-                )
 
                 metrics.update(
                     {
                         f"class_{class_id}_accuracy": class_accuracy,
-                        f"class_{class_id}_precision": class_precision,
-                        f"class_{class_id}_recall": class_recall,
-                        f"class_{class_id}_f1": class_f1,
                     }
                 )
 
@@ -551,9 +533,6 @@ def compute_metrics_and_log(queue, accelerator):
                     columns=[
                         "Class",
                         "Accuracy",
-                        "Precision",
-                        "Recall",
-                        "F1",
                         "AUC-ROC",
                     ]
                 )
@@ -561,9 +540,6 @@ def compute_metrics_and_log(queue, accelerator):
                     table.add_data(
                         class_id,
                         metrics[f"class_{class_id}_accuracy"],
-                        metrics[f"class_{class_id}_precision"],
-                        metrics[f"class_{class_id}_recall"],
-                        metrics[f"class_{class_id}_f1"],
                         metrics.get(f"class_{class_id}_auc_roc", "N/A"),
                     )
                 wandb.log({f"{mode}_per_class_metrics": table})
@@ -887,7 +863,7 @@ def main():
             val_outputs = []
             val_labels = []
             with torch.no_grad():
-                for val_batch in val_loader:
+                for val_batch in tqdm(val_loader):
                     val_images, val_targets = (
                         val_batch["image"],
                         val_batch["labels"]["target"].float(),
