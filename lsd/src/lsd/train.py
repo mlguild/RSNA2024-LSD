@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import timm
@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 
 import wandb
 from lsd.src.lsd.data import (
+    BalancedBatchSampler,
     Importance,
     ISIC2024Dataset,
     SplitNames,
@@ -44,17 +45,38 @@ def create_dataloaders(
     eval_batch_size: int,
     num_workers: int,
     root_dir: str,
-    val_split: float,
-    test_split: float,
     image_size: int,
     seed: int,
+    model_transform_config: Callable,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    common_transforms = T.Compose([T.Resize(image_size), T.ToTensor()])
+    common_transforms = T.Compose(
+        [
+            T.Resize(
+                image_size,
+                interpolation=model_transform_config["interpolation"],
+            ),
+            T.ToTensor(),
+            T.Normalize(
+                mean=model_transform_config["mean"],
+                std=model_transform_config["std"],
+            ),
+        ]
+    )
     train_transforms = T.Compose(
-        [T.Resize(image_size), StandardAugmentations(), T.ToTensor()]
+        [
+            T.Resize(
+                image_size,
+                interpolation=model_transform_config["interpolation"],
+            ),
+            StandardAugmentations(),
+            T.Normalize(
+                mean=model_transform_config["mean"],
+                std=model_transform_config["std"],
+            ),
+        ]
     )
 
-    full_dataset = ISIC2024Dataset(
+    train_dataset = ISIC2024Dataset(
         root_dir=root_dir,
         split_name=SplitNames.TRAIN,
         transform=train_transforms,
@@ -62,45 +84,46 @@ def create_dataloaders(
         return_samples_as_dict=True,
     )
 
-    dataset_size = len(full_dataset)
-    val_size = int(val_split * dataset_size)
-    test_size = int(test_split * dataset_size)
-    train_size = dataset_size - val_size - test_size
-
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset,
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(seed),
+    val_dataset = ISIC2024Dataset(
+        root_dir=root_dir,
+        split_name=SplitNames.VAL,
+        transform=common_transforms,
+        importance_level_labels=Importance.HIGH,
+        return_samples_as_dict=True,
     )
 
-    # Set appropriate transforms
-    val_dataset.dataset.transform = common_transforms
-    test_dataset.dataset.transform = common_transforms
+    test_dataset = ISIC2024Dataset(
+        root_dir=root_dir,
+        split_name=SplitNames.DEVTEST,
+        transform=common_transforms,
+        importance_level_labels=Importance.HIGH,
+        return_samples_as_dict=True,
+    )
 
     # Use BalancedBatchSampler for training
-    # try:
-    #     train_sampler = BalancedBatchSampler(
-    #         train_dataset, train_batch_size, class_ratios=[0.8, 0.2]
-    #     )
-    #     train_loader = DataLoader(
-    #         train_dataset,
-    #         batch_sampler=train_sampler,
-    #         num_workers=num_workers,
-    #         pin_memory=True,
-    #     )
-    #     print(
-    #         f"Successfully created BalancedBatchSampler with {len(train_sampler)} batches"
-    #     )
-    # except Exception as e:
-    #     print(f"Error creating BalancedBatchSampler: {str(e)}")
-    #     print("Falling back to regular DataLoader for training")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=train_batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    try:
+        train_sampler = BalancedBatchSampler(
+            train_dataset, train_batch_size, class_ratios=[0.5, 0.5]
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+        print(
+            f"Successfully created BalancedBatchSampler with {len(train_sampler)} batches"
+        )
+    except Exception as e:
+        print(f"Error creating BalancedBatchSampler: {str(e)}")
+        print("Falling back to regular DataLoader for training")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
 
     val_loader = DataLoader(
         val_dataset,
@@ -348,22 +371,26 @@ def main():
         )
 
     accelerator.print("[bold green]Creating dataloaders...[/bold green]")
+
+    model = timm.create_model(
+        MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES
+    )
+
+    data_cfg = timm.data.resolve_data_config(model.pretrained_cfg)
+
+    model = SyncBatchNorm.convert_sync_batchnorm(model)
+
     train_loader, val_loader, test_loader = create_dataloaders(
         TRAIN_MICRO_BATCH_SIZE,
         EVAL_BATCH_SIZE,
         NUM_WORKERS,
         ROOT_DIR,
-        VAL_SPLIT,
-        TEST_SPLIT,
         IMAGE_SIZE,
         SEED,
+        data_cfg,
     )
 
     accelerator.print("[bold green]Loading model...[/bold green]")
-    model = timm.create_model(
-        MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES
-    )
-    model = SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)

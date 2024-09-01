@@ -30,6 +30,7 @@ class DatasetNames(StrEnum):
 class SplitNames(StrEnum):
     TRAIN = "train"
     VAL = "val"
+    DEVTEST = "devtest"
     TEST = "test"
 
 
@@ -180,7 +181,13 @@ class ISIC2024Dataset(Dataset):
         self.file_count_after_download_and_extract = ISIC2024_COUNT
         self.return_samples_as_dict = return_samples_as_dict
 
-        if split_name == SplitNames.TRAIN or split_name == SplitNames.VAL:
+        self.split_name = split_name
+
+        if split_name in {
+            SplitNames.TRAIN,
+            SplitNames.VAL,
+            SplitNames.DEVTEST,
+        }:
             target_split_name = "train"
         elif split_name == SplitNames.TEST:
             target_split_name = "test"
@@ -200,6 +207,13 @@ class ISIC2024Dataset(Dataset):
         )
         self.metadata = pd.read_csv(self.metadata_path)
 
+        if split_name in {
+            SplitNames.TRAIN,
+            SplitNames.VAL,
+            SplitNames.DEVTEST,
+        }:
+            self.metadata = self._split_metadata()
+
         self.label_keys_to_use = [
             item.name
             for item in METADATA_KEYS_TO_USE
@@ -208,6 +222,23 @@ class ISIC2024Dataset(Dataset):
 
         print("Creating class to index mapper...")
         self.class_indices = self.create_class_indices()
+
+    def _split_metadata(self):
+        """Split the training metadata into train, val, and devtest"""
+        train_ratio, val_ratio, devtest_ratio = 0.9, 0.05, 0.05
+        train_end = int(train_ratio * len(self.metadata))
+        val_end = int((train_ratio + val_ratio) * len(self.metadata))
+
+        if self.split_name == SplitNames.TRAIN:
+            return self.metadata[:train_end]
+        elif self.split_name == SplitNames.VAL:
+            return self.metadata[train_end:val_end]
+        elif self.split_name == SplitNames.DEVTEST:
+            return self.metadata[val_end:]
+        else:
+            raise ValueError(
+                f"Invalid split name for splitting metadata: {self.split_name}"
+            )
 
     def create_class_indices(self):
         class_indices = defaultdict(list)
@@ -267,7 +298,7 @@ class ISIC2024Dataset(Dataset):
 class BalancedBatchSampler(Sampler):
     def __init__(
         self,
-        dataset: torch.utils.data.Subset,
+        dataset: ISIC2024Dataset,
         batch_size: int,
         class_ratios: List[float],
     ):
@@ -283,9 +314,7 @@ class BalancedBatchSampler(Sampler):
         # Create class indices based on the Subset
         self.class_indices = [[] for _ in range(self.num_classes)]
         for idx in range(len(self.dataset)):
-            label = self.dataset.dataset.metadata.iloc[
-                self.dataset.indices[idx]
-            ]["target"]
+            label = self.dataset.metadata.iloc[idx]["target"]
             self.class_indices[int(label)].append(idx)
 
         # Print class distribution
@@ -357,7 +386,6 @@ class BalancedBatchSampler(Sampler):
             np.random.shuffle(batch)
             yield batch
             self.batch_count += 1
-            print(f"Yielded batch {self.batch_count}")
 
     def __len__(self) -> int:
         return self.num_batches_per_epoch
