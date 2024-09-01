@@ -693,6 +693,13 @@ def save_checkpoint(
             )
 
 
+def set_dropout_rate(model: nn.Module, dropout_rate: float) -> nn.Module:
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = dropout_rate
+    return model
+
+
 def main():
     # Hyperparameters
     TRAIN_MICRO_BATCH_SIZE = 128
@@ -715,7 +722,9 @@ def main():
         f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
     )
 
-    CHECKPOINT_DIR = f"experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
+    CHECKPOINT_DIR = (
+        f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
+    )
     LOG_EVERY = 100  # Log every 10 steps
 
     # Initialize accelerator
@@ -755,10 +764,11 @@ def main():
         num_classes=NUM_CLASSES,
         drop_rate=DROPOUT_RATE,
     )
+    model = set_dropout_rate(model, DROPOUT_RATE)
 
     data_cfg = timm.data.resolve_data_config(model.pretrained_cfg)
 
-    model = SyncBatchNorm.convert_sync_batchnorm(model)
+    print(model)
 
     train_loader, val_loader, test_loader = create_dataloaders(
         TRAIN_MICRO_BATCH_SIZE,
