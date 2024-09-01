@@ -1,22 +1,18 @@
 import os
-import PIL
-import PIL.Image
-import torch
-import timm
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import List, Tuple
-from torch.nn import SyncBatchNorm
+import PIL
+import PIL.Image
+import timm
+import torch
+import torchvision.transforms as T
 from accelerate import Accelerator
+from torch.nn import SyncBatchNorm
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import torchvision.transforms as T
-from train import (
-    ISIC2024Dataset,
-    SplitNames,
-    Importance,
-    AveragingEnsemble,
-)
+from train import AveragingEnsemble, Importance, ISIC2024Dataset, SplitNames
 
 
 def load_best_models(

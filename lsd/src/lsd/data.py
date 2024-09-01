@@ -1,9 +1,8 @@
 import concurrent.futures
+import hashlib
 import io
 import json
-import hashlib
 import multiprocessing as mp
-import os
 import pathlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -14,7 +13,6 @@ import h5py
 import numpy as np
 import pandas as pd
 import PIL.Image
-import torch
 import torchvision.transforms as T
 from gate.data import download_kaggle_dataset
 from gate.data.image.classification.imagenet1k import StandardAugmentations

@@ -1,21 +1,17 @@
 import os
-import torch
-import timm
-import numpy as np
 from typing import List, Tuple
-from torch.nn import SyncBatchNorm
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from tqdm import tqdm
 
+import numpy as np
+import timm
+import torch
+from accelerate import Accelerator
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+from torch.nn import SyncBatchNorm
+from tqdm import tqdm
 from train import (
-    ISIC2024Dataset,
-    SplitNames,
-    Importance,
     AveragingEnsemble,
-    create_dataloaders,
     compute_metrics,
+    create_dataloaders,
 )
 
 
