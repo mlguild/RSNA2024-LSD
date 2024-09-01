@@ -513,59 +513,39 @@ def compute_metrics(
         return metrics
 
 
-def compute_metrics_and_log(queue, accelerator):
-    while True:
-        item = queue.get()
-        if item is None:
-            break
+def log_metrics_and_images(
+    metrics: Dict[str, float],
+    images: List[Dict],
+    mode: str,
+    iter_id: int,
+    accelerator: Accelerator,
+):
+    if accelerator.is_local_main_process:
+        wandb.log({f"{mode}_{k}": v for k, v in metrics.items()})
 
-        outputs, labels, iter_id, mode = item
-
-        metrics = compute_metrics(outputs, labels)
-        metrics[f"{mode}_iter"] = iter_id
-
-        if accelerator.is_local_main_process:
-            wandb.log({f"{mode}_{k}": v for k, v in metrics.items()})
-
-            # Log per-class metrics in a table
-            if "class_0_accuracy" in metrics:
-                table = wandb.Table(
-                    columns=[
-                        "Class",
-                        "Accuracy",
-                        "AUC-ROC",
-                    ]
+        # Log per-class metrics in a table
+        if "class_0_accuracy" in metrics:
+            table = wandb.Table(columns=["Class", "Accuracy", "AUC-ROC"])
+            for class_id in range(2):  # Assuming binary classification
+                table.add_data(
+                    class_id,
+                    metrics[f"class_{class_id}_accuracy"],
+                    metrics.get(f"class_{class_id}_auc_roc", "N/A"),
                 )
-                for class_id in range(2):  # Assuming binary classification
-                    table.add_data(
-                        class_id,
-                        metrics[f"class_{class_id}_accuracy"],
-                        metrics.get(f"class_{class_id}_auc_roc", "N/A"),
-                    )
-                wandb.log({f"{mode}_per_class_metrics": table})
+            wandb.log({f"{mode}_per_class_metrics": table})
 
-        queue.task_done()
-
-
-def log_images_thread(queue, accelerator):
-    while True:
-        item = queue.get()
-        if item is None:
-            break
-
-        results, mode, iter_id = item
-
-        if accelerator.is_local_main_process:
-            images = [
+        # Log images
+        if images:
+            wandb_images = [
                 wandb.Image(
                     r["image"],
                     caption=f"Predicted: {torch.sigmoid(r['output']).item():.4f}, Target: {r['label'].item()}",
                 )
-                for r in results[:100]
+                for r in images[:100]
             ]
-            wandb.log({f"{mode}_examples": images, f"{mode}_iter": iter_id})
-
-        queue.task_done()
+            wandb.log(
+                {f"{mode}_examples": wandb_images, f"{mode}_iter": iter_id}
+            )
 
 
 def create_dataloaders(
@@ -736,6 +716,7 @@ def main():
     )
 
     CHECKPOINT_DIR = f"experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
+    LOG_EVERY = 100  # Log every 10 steps
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -802,26 +783,14 @@ def main():
         )
     )
 
-    # Create queues and start threads
-    metric_queue = Queue()
-    image_queue = Queue()
-
-    metric_thread = threading.Thread(
-        target=compute_metrics_and_log, args=(metric_queue, accelerator)
-    )
-    image_thread = threading.Thread(
-        target=log_images_thread, args=(image_queue, accelerator)
-    )
-
-    metric_thread.start()
-    image_thread.start()
+    metric_cache = []
+    image_cache = []
 
     accelerator.print("[bold green]Starting training...[/bold green]")
     best_val_pauc = 0
     best_models = []
 
     train_iter = iter(train_loader)
-    train_results = []
     for iter_id in tqdm(range(1, NUM_TRAIN_ITER + 1), desc="Training"):
         try:
             batch = next(train_iter)
@@ -838,25 +807,37 @@ def main():
         optimizer.step()
         optimizer.zero_grad()
 
-        # Add metrics computation to queue
-        metric_queue.put(
-            (outputs.detach().cpu(), labels.cpu(), iter_id, "train")
+        # Compute metrics
+        metrics = compute_metrics(outputs.detach().cpu(), labels.cpu())
+        metrics["train_iter"] = iter_id
+        metric_cache.append(metrics)
+
+        # Cache images
+        image_cache.extend(
+            [
+                {
+                    "image": img.cpu(),
+                    "output": out.cpu(),
+                    "label": lbl.cpu(),
+                }
+                for img, out, lbl in zip(batch["image"], outputs, labels)
+            ]
         )
 
-        if accelerator.is_local_main_process:
-            train_results.extend(
-                [
-                    {
-                        "image": img.cpu(),
-                        "output": out.cpu(),
-                        "label": lbl.cpu(),
-                    }
-                    for img, out, lbl in zip(batch["image"], outputs, labels)
-                ]
+        # Log metrics and images every LOG_EVERY steps
+        if iter_id % LOG_EVERY == 0:
+            log_metrics_and_images(
+                {
+                    k: np.mean([m[k] for m in metric_cache])
+                    for k in metric_cache[0]
+                },
+                image_cache,
+                "train",
+                iter_id,
+                accelerator,
             )
-            if len(train_results) >= 100:
-                image_queue.put((train_results, "train", iter_id))
-                train_results = []
+            metric_cache = []
+            image_cache = []
 
         if iter_id % VALIDATE_EVERY == 0:
             model.eval()
@@ -869,29 +850,31 @@ def main():
                         val_batch["labels"]["target"].float(),
                     )
                     val_out = model(val_images).squeeze()
-                    val_outputs.append(val_out)
-                    val_labels.append(val_targets)
+                    val_outputs.append(val_out.cpu())
+                    val_labels.append(val_targets.cpu())
 
             val_outputs = torch.cat(val_outputs)
             val_labels = torch.cat(val_labels)
 
-            # Add validation metrics computation to queue
-            metric_queue.put(
-                (val_outputs.cpu(), val_labels.cpu(), iter_id, "val")
-            )
-
-            if accelerator.is_local_main_process:
-                val_results = [
+            # Compute and log validation metrics
+            val_metrics = compute_metrics(val_outputs.cpu(), val_labels.cpu())
+            val_metrics["val_iter"] = iter_id
+            log_metrics_and_images(
+                val_metrics,
+                [
                     {
-                        "image": img,
-                        "output": out,
-                        "label": lbl,
+                        "image": img.cpu(),
+                        "output": out.cpu(),
+                        "label": lbl.cpu(),
                     }
                     for img, out, lbl in zip(
                         val_batch["image"], val_outputs, val_labels
                     )
-                ]
-                image_queue.put((val_results, "val", iter_id))
+                ],
+                "val",
+                iter_id,
+                accelerator,
+            )
 
             # Save checkpoint
             save_checkpoint(
@@ -900,7 +883,7 @@ def main():
                 optimizer,
                 iter_id // len(train_loader) + 1,
                 iter_id,
-                {"iter": iter_id},  # We'll update metrics later
+                val_metrics,
                 accelerator,
                 is_best=False,  # We'll determine this after getting metrics
             )
@@ -908,12 +891,6 @@ def main():
     accelerator.print(
         "[bold green]Training completed. Creating ensemble...[/bold green]"
     )
-
-    # Stop the threads
-    metric_queue.put(None)
-    image_queue.put(None)
-    metric_thread.join()
-    image_thread.join()
 
     # Load the best checkpoints and create an ensemble
     best_checkpoints = sorted(os.listdir(CHECKPOINT_DIR))[-TOP_K_MODELS:]
