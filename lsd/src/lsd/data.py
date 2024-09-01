@@ -151,15 +151,13 @@ METADATA_KEYS_TO_USE = [
         name="tbp_lv_dnn_lesion_confidence", importance=Importance.HIGH
     ),
 ]
+ISIC_ID = "isic_id"
 
 
 @dataclass
 class DataItem:
     image: PIL.Image.Image
     labels: Dict[str, Any]
-
-
-ISIC_ID = "isic_id"
 
 
 class ISIC2024Dataset(Dataset):
