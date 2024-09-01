@@ -1,4 +1,6 @@
 import os
+import PIL
+import PIL.Image
 import torch
 import timm
 import numpy as np
@@ -8,7 +10,7 @@ from torch.nn import SyncBatchNorm
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+import torchvision.transforms as T
 from train import (
     ISIC2024Dataset,
     SplitNames,
@@ -41,7 +43,7 @@ def predict(
     model.eval()
     all_predictions = []
     all_isic_ids = []
-
+    print(f"Total samples {len(dataloader)}")
     with torch.no_grad():
         for batch in tqdm(
             dataloader,
@@ -97,10 +99,23 @@ def main():
 
     # Prepare data
     data_cfg = timm.data.resolve_data_config(ensemble_models[0].pretrained_cfg)
+    common_transforms = T.Compose(
+        [
+            T.Resize(
+                IMAGE_SIZE,
+                interpolation=PIL.Image.Resampling.BICUBIC,
+            ),
+            T.ToTensor(),
+            T.Normalize(
+                mean=data_cfg["mean"],
+                std=data_cfg["std"],
+            ),
+        ]
+    )
     dataset = ISIC2024Dataset(
         root_dir=ROOT_DIR,
         split_name=SplitNames.TEST,  # Using the test set for predictions
-        transform=data_cfg["test_transform"],
+        transform=common_transforms,
         importance_level_labels=Importance.HIGH,
         return_samples_as_dict=True,
     )

@@ -218,8 +218,15 @@ class ISIC2024Dataset(Dataset):
             if item.importance <= importance_level_labels
         ]
 
-        print("Creating class to index mapper...")
-        self.class_indices = self.create_class_indices()
+        # Check if 'target' is available in the metadata
+        self.has_targets = "target" in self.metadata.columns
+
+        if self.has_targets:
+            print("Creating class to index mapper...")
+            self.class_indices = self.create_class_indices()
+        else:
+            print("No targets available. Skipping class to index mapping.")
+            self.class_indices = None
 
     def _split_metadata(self):
         """Split the training metadata into train, val, and devtest"""
@@ -239,6 +246,9 @@ class ISIC2024Dataset(Dataset):
             )
 
     def create_class_indices(self):
+        if not self.has_targets:
+            return None
+
         class_indices = defaultdict(list)
 
         def process_row(args):
@@ -278,7 +288,9 @@ class ISIC2024Dataset(Dataset):
 
     def __getitem__(self, idx):
         labels = {
-            key: self.metadata.iloc[idx][key] for key in self.label_keys_to_use
+            key: self.metadata.iloc[idx][key]
+            for key in self.label_keys_to_use
+            if key in self.metadata.columns
         }
         image_bytes = self.data[labels[ISIC_ID]][()]
         image = PIL.Image.open(io.BytesIO(image_bytes))
@@ -308,6 +320,14 @@ class BalancedBatchSampler(Sampler):
         print(
             f"Initializing BalancedBatchSampler with batch size {batch_size} and class ratios {class_ratios}"
         )
+
+        if not self.dataset.has_targets:
+            print(
+                "Dataset has no targets. Using random sampling instead of balanced sampling."
+            )
+            self.indices = list(range(len(self.dataset)))
+            self.num_batches_per_epoch = len(self.indices) // batch_size
+            return
 
         # Create class indices based on the Subset
         self.class_indices = [[] for _ in range(self.num_classes)]
@@ -346,36 +366,37 @@ class BalancedBatchSampler(Sampler):
         self._reshuffle_indices()
 
     def _reshuffle_indices(self):
-        """Reshuffle class indices for a new epoch."""
-        # print("Reshuffling indices for a new epoch.")
+        if not self.dataset.has_targets:
+            np.random.shuffle(self.indices)
+            return
+
         self.remaining_indices = [
             np.random.permutation(indices).tolist()
             for indices in self.class_indices
         ]
 
     def __iter__(self) -> Iterator[List[int]]:
+        if not self.dataset.has_targets:
+            for i in range(0, len(self.indices), self.batch_size):
+                yield self.indices[i : i + self.batch_size]
+            return
+
         while True:  # Infinite loop to keep yielding batches
             if self.batch_count >= self.num_batches_per_epoch:
                 self._reshuffle_indices()
+                self.batch_count = 0
 
             batch = []
             for class_idx, num_samples in enumerate(self.samples_per_class):
                 class_indices = self.remaining_indices[class_idx]
 
                 if len(class_indices) < num_samples:
-                    # print(
-                    #     f"Not enough samples in class {class_idx}. Reshuffling the indices."
-                    # )
-                    # Reshuffle within the class if we run out of samples mid-epoch
                     self.remaining_indices[class_idx] = np.random.permutation(
                         self.class_indices[class_idx]
                     ).tolist()
                     class_indices = self.remaining_indices[class_idx]
 
                 sampled_indices = class_indices[:num_samples]
-                # print(
-                #     f"Sampled indices for class {class_idx}: {sampled_indices}"
-                # )
                 batch.extend(sampled_indices)
                 self.remaining_indices[class_idx] = class_indices[
                     num_samples:
@@ -392,37 +413,44 @@ class BalancedBatchSampler(Sampler):
 def main():
     tmp_data_dir = "/mnt/nvme-fast0/datasets/"
     transforms = [T.Resize(224), StandardAugmentations(), T.ToTensor()]
-    dataset = ISIC2024Dataset(
+
+    # Load train dataset
+    train_dataset = ISIC2024Dataset(
         root_dir=tmp_data_dir,
+        split_name=SplitNames.TRAIN,
         transform=T.Compose(transforms),
         return_samples_as_dict=True,
     )
 
-    print(f"Total dataset size: {len(dataset)}")
-    print("Class distribution:")
-    for class_idx, indices in dataset.class_indices.items():
+    print(f"Train dataset size: {len(train_dataset)}")
+    print("Train class distribution:")
+    for class_idx, indices in train_dataset.class_indices.items():
         print(f"Class {class_idx}: {len(indices)} samples")
 
     batch_size = 32
     class_ratios = [0.8, 0.2]  # 80% class 0, 20% class 1
-    balanced_sampler = BalancedBatchSampler(dataset, batch_size, class_ratios)
+    balanced_sampler = BalancedBatchSampler(
+        train_dataset, batch_size, class_ratios
+    )
 
-    print(f"Number of batches: {len(balanced_sampler)}")
-
-    dataloader = DataLoader(
-        dataset,
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_sampler=balanced_sampler,
         num_workers=16,
         pin_memory=True,
     )
 
+    # Check a few batches from the train dataloader
     label_frequencies = defaultdict(int)
-    num_batches_to_check = min(
-        10, len(balanced_sampler)
-    )  # Adjust this to check more or fewer batches
+    num_batches_to_check = min(10, len(balanced_sampler))
 
+    print("\nChecking train batches:")
     for i, item in enumerate(
-        tqdm(dataloader, total=num_batches_to_check, desc="Checking batches")
+        tqdm(
+            train_dataloader,
+            total=num_batches_to_check,
+            desc="Checking train batches",
+        )
     ):
         if i >= num_batches_to_check:
             break
@@ -431,6 +459,50 @@ def main():
 
         print(f"Batch {i+1} label frequencies: {dict(label_frequencies)}")
         label_frequencies.clear()  # Reset for next batch
+
+    # Load test dataset
+    test_transforms = [
+        T.Resize(224),
+        T.ToTensor(),
+    ]  # No augmentations for test set
+    test_dataset = ISIC2024Dataset(
+        root_dir=tmp_data_dir,
+        split_name=SplitNames.TEST,
+        transform=T.Compose(test_transforms),
+        return_samples_as_dict=True,
+    )
+
+    print(f"\nTest dataset size: {len(test_dataset)}")
+
+    # Create a simple dataloader for the test dataset (no balanced sampling)
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+    )
+
+    # Check a few batches from the test dataloader
+    print("\nChecking test batches:")
+    for i, item in enumerate(
+        tqdm(test_dataloader, total=5, desc="Checking test batches")
+    ):
+        if i >= 5:
+            break
+        print(f"Batch {i+1}:")
+        print(f"  Batch size: {len(item['image'])}")
+        print(f"  Image shape: {item['image'][0].shape}")
+        print(f"  Available labels: {list(item['labels'].keys())}")
+        print(f"  Sample ISIC ID: {item['labels']['isic_id'][0]}")
+
+        # Check if 'target' is in the labels (it shouldn't be for the test set)
+        if "target" in item["labels"]:
+            print("  WARNING: 'target' found in test set labels!")
+        else:
+            print("  'target' not in labels (as expected for test set)")
+
+        print("\n")
 
     print("Finished checking batches.")
 
