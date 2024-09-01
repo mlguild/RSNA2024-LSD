@@ -1,6 +1,8 @@
 import os
 from typing import Callable, Dict, List, Tuple
 
+import PIL
+import PIL.Image
 import numpy as np
 import timm
 import torch
@@ -53,7 +55,7 @@ def create_dataloaders(
         [
             T.Resize(
                 image_size,
-                interpolation=model_transform_config["interpolation"],
+                interpolation=PIL.Image.Resampling.BICUBIC,
             ),
             T.ToTensor(),
             T.Normalize(
@@ -66,9 +68,10 @@ def create_dataloaders(
         [
             T.Resize(
                 image_size,
-                interpolation=model_transform_config["interpolation"],
+                interpolation=PIL.Image.Resampling.BICUBIC,
             ),
             StandardAugmentations(),
+            T.ToTensor(),
             T.Normalize(
                 mean=model_transform_config["mean"],
                 std=model_transform_config["std"],
@@ -326,7 +329,7 @@ def main():
 
     EVAL_BATCH_SIZE = 512
     NUM_WORKERS = 16
-    LEARNING_RATE = 3e-4
+    LEARNING_RATE = 6e-6
     NUM_TRAIN_ITER = 10000
     VALIDATE_EVERY = 100
     NUM_CLASSES = 1  # Binary classification
@@ -339,6 +342,7 @@ def main():
     MIXED_PRECISION = "bf16"
     PROJECT_NAME = "isic2024-training"
     IMAGE_SIZE = 224
+    WEIGHT_DECAY = 0.0001
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -393,7 +397,9 @@ def main():
     accelerator.print("[bold green]Loading model...[/bold green]")
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
 
     model, optimizer, train_loader, val_loader, test_loader = (
         accelerator.prepare(
