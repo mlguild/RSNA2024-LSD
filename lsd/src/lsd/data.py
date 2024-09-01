@@ -1,17 +1,24 @@
+import concurrent.futures
 import io
+import multiprocessing as mp
 import pathlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import h5py
+import numpy as np
 import pandas as pd
 import PIL.Image
+import torch
+import torchvision.transforms as T
 from gate.data import download_kaggle_dataset
+from gate.data.image.classification.imagenet1k import StandardAugmentations
 from rich import print
 from rich.traceback import install
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 
 install()
 
@@ -86,12 +93,10 @@ class MetadataInfo:
 
 
 class Importance:
-    HIGH = 1  # should be used in first string of experiments, MUST HAVEs
-    MEDIUM = 2  # could offer additional modelling power, to be used in later experiments, MAY HAVEs
-    LOW = 3  # unlikely to offer additional modelling power, to be used in later experiments, ???
-    VERY_LOW = (
-        4  # very unlikely to offer additional modelling power, not be used
-    )
+    HIGH = 1
+    MEDIUM = 2
+    LOW = 3
+    VERY_LOW = 4
 
 
 METADATA_KEYS_TO_USE = [
@@ -99,10 +104,7 @@ METADATA_KEYS_TO_USE = [
     MetadataInfo(name="target", importance=Importance.HIGH),
     MetadataInfo(name="patient_id", importance=Importance.VERY_LOW),
     MetadataInfo(name="clin_size_long_diam_mm", importance=Importance.MEDIUM),
-    MetadataInfo(
-        name="image_type",
-        importance=Importance.MEDIUM,
-    ),
+    MetadataInfo(name="image_type", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_tile_type", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_A", importance=Importance.MEDIUM),
     MetadataInfo(name="tbp_lv_Aext", importance=Importance.MEDIUM),
@@ -160,7 +162,6 @@ ISIC_ID = "isic_id"
 
 
 class ISIC2024Dataset(Dataset):
-
     def __init__(
         self,
         root_dir: str | pathlib.Path,
@@ -181,32 +182,23 @@ class ISIC2024Dataset(Dataset):
 
         if split_name == SplitNames.TRAIN or split_name == SplitNames.VAL:
             target_split_name = "train"
-            self.data = (
-                self.root_dir
-                / DatasetNames.ISIC_2024
-                / f"{target_split_name}-image.hdf5"
-            )
-            self.data = h5py.File(self.data, "r")
-            self.metadata_path = (
-                self.root_dir
-                / DatasetNames.ISIC_2024
-                / f"{target_split_name}-metadata.csv"
-            )
-            self.metadata = pd.read_csv(self.metadata_path)
         elif split_name == SplitNames.TEST:
             target_split_name = "test"
-            self.data = (
-                self.root_dir
-                / DatasetNames.ISIC_2024
-                / f"{target_split_name}-image.hdf5"
-            )
-            self.data = h5py.File(self.data, "r")
-            self.metadata_path = (
-                self.root_dir
-                / DatasetNames.ISIC_2024
-                / f"{target_split_name}-metadata.csv"
-            )
-            self.metadata = pd.read_csv(self.metadata_path)
+        else:
+            raise ValueError(f"Invalid split name: {split_name}")
+
+        self.data = (
+            self.root_dir
+            / DatasetNames.ISIC_2024
+            / f"{target_split_name}-image.hdf5"
+        )
+        self.data = h5py.File(self.data, "r")
+        self.metadata_path = (
+            self.root_dir
+            / DatasetNames.ISIC_2024
+            / f"{target_split_name}-metadata.csv"
+        )
+        self.metadata = pd.read_csv(self.metadata_path)
 
         self.label_keys_to_use = [
             item.name
@@ -214,9 +206,35 @@ class ISIC2024Dataset(Dataset):
             if item.importance <= importance_level_labels
         ]
 
+        print("Creating class to index mapper...")
+        self.class_indices = self.create_class_indices()
+
+    def create_class_indices(self):
+        class_indices = defaultdict(list)
+
+        def process_row(args):
+            idx, row = args
+            return int(row["target"]), idx
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=mp.cpu_count()
+        ) as executor:
+            future_to_row = {
+                executor.submit(process_row, (idx, row)): idx
+                for idx, row in self.metadata.iterrows()
+            }
+
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_row),
+                total=len(self.metadata),
+                desc="Processing rows",
+            ):
+                target, idx = future.result()
+                class_indices[target].append(idx)
+
+        return class_indices
+
     def download_extract_data(self):
-        # use kaggle to download the isic-2024-challenge dataset
-        # kaggle competitions download -c isic-2024-challenge
         download_kaggle_dataset(
             dataset_name=DatasetNames.ISIC_2024,
             dataset_path=DatasetNames.ISIC_2024,
@@ -230,7 +248,6 @@ class ISIC2024Dataset(Dataset):
         return len(self.metadata)
 
     def __getitem__(self, idx):
-
         labels = {
             key: self.metadata.iloc[idx][key] for key in self.label_keys_to_use
         }
@@ -247,67 +264,150 @@ class ISIC2024Dataset(Dataset):
         return output
 
 
-if __name__ == "__main__":
-    # tmp_data_dir = "/mnt/nvme-fast0/datasets/"
-    # dataset = Isic2024Dataset(root_dir=tmp_data_dir)
-    # print(dataset)
-    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    # print(dataloader)
-    # for data in dataloader:
-    #     print(data)
-    #     break
-    # load in an hdf5 file and iterate the first 10 entries
-    # import h5py
-    # import numpy as np
-    # from PIL import Image
-    # import io
+class BalancedBatchSampler(Sampler):
+    def __init__(
+        self,
+        dataset: torch.utils.data.Subset,
+        batch_size: int,
+        class_ratios: List[float],
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.class_ratios = class_ratios
+        self.num_classes = len(class_ratios)
 
-    # hdf5_file_path = "/mnt/nvme-fast0/datasets/isic-2024-challenge/train-image.hdf5"
-    # with h5py.File(hdf5_file_path, "r") as f:
-    #     for key, value in f.items():
-    #         print(key)
-    #         # inspect an HDF5 dataset object stored in value
-    #         # cast it as a numpy array
-    #         image_bytes = value[()]
-    #         # convert the numpy array to a PIL image
-    #         image = Image.open(io.BytesIO(image_bytes))
-    #         image.save("dummy.png")
-    #         break
+        print(
+            f"Initializing BalancedBatchSampler with batch size {batch_size} and class ratios {class_ratios}"
+        )
 
-    # csv_file_path = "/mnt/nvme-fast0/datasets/isic-2024-challenge/train-metadata.csv"
+        # Create class indices based on the Subset
+        self.class_indices = [[] for _ in range(self.num_classes)]
+        for idx in range(len(self.dataset)):
+            label = self.dataset.dataset.metadata.iloc[
+                self.dataset.indices[idx]
+            ]["target"]
+            self.class_indices[int(label)].append(idx)
 
-    # # iterate the first 10 entries in the metadata csv file
-    # import pandas as pd
+        # Print class distribution
+        for class_idx, indices in enumerate(self.class_indices):
+            print(f"Class {class_idx}: {len(indices)} samples")
 
-    # metadata = pd.read_csv(csv_file_path)
-    # # show the full verbose first 10 entries
-    # # drop columns that are not available for all entries
-    # metadata = metadata.dropna(axis=1, how="any")
-    # # show all columns keys
-    # print(metadata.columns)
+        # Calculate number of samples for each class in a batch
+        self.samples_per_class = [
+            max(1, int(batch_size * ratio)) for ratio in class_ratios
+        ]
 
+        # Adjust if total samples exceed batch size
+        while sum(self.samples_per_class) > batch_size:
+            max_class = self.samples_per_class.index(
+                max(self.samples_per_class)
+            )
+            self.samples_per_class[max_class] -= 1
+
+        print(f"Samples per class in each batch: {self.samples_per_class}")
+
+        # Calculate the number of batches
+        self.num_batches_per_epoch = min(
+            len(indices) // samples
+            for indices, samples in zip(
+                self.class_indices, self.samples_per_class
+            )
+        )
+        print(f"Number of batches per epoch: {self.num_batches_per_epoch}")
+        self.batch_count = 0
+        # Start off by reshuffling indices
+        self._reshuffle_indices()
+
+    def _reshuffle_indices(self):
+        """Reshuffle class indices for a new epoch."""
+        # print("Reshuffling indices for a new epoch.")
+        self.remaining_indices = [
+            np.random.permutation(indices).tolist()
+            for indices in self.class_indices
+        ]
+
+    def __iter__(self) -> Iterator[List[int]]:
+        while True:  # Infinite loop to keep yielding batches
+            if self.batch_count >= self.num_batches_per_epoch:
+                self._reshuffle_indices()
+
+            batch = []
+            for class_idx, num_samples in enumerate(self.samples_per_class):
+                class_indices = self.remaining_indices[class_idx]
+
+                if len(class_indices) < num_samples:
+                    # print(
+                    #     f"Not enough samples in class {class_idx}. Reshuffling the indices."
+                    # )
+                    # Reshuffle within the class if we run out of samples mid-epoch
+                    self.remaining_indices[class_idx] = np.random.permutation(
+                        self.class_indices[class_idx]
+                    ).tolist()
+                    class_indices = self.remaining_indices[class_idx]
+
+                sampled_indices = class_indices[:num_samples]
+                # print(
+                #     f"Sampled indices for class {class_idx}: {sampled_indices}"
+                # )
+                batch.extend(sampled_indices)
+                self.remaining_indices[class_idx] = class_indices[
+                    num_samples:
+                ]  # Remove sampled indices
+
+            np.random.shuffle(batch)
+            yield batch
+            self.batch_count += 1
+            print(f"Yielded batch {self.batch_count}")
+
+    def __len__(self) -> int:
+        return self.num_batches_per_epoch
+
+
+def main():
     tmp_data_dir = "/mnt/nvme-fast0/datasets/"
-    from gate.data.image.classification.imagenet1k import StandardAugmentations
-    from tqdm.auto import tqdm
-    import torchvision.transforms as T
-    from torch.utils.data import DataLoader
-
     transforms = [T.Resize(224), StandardAugmentations(), T.ToTensor()]
     dataset = ISIC2024Dataset(
         root_dir=tmp_data_dir,
         transform=T.Compose(transforms),
         return_samples_as_dict=True,
     )
+
+    print(f"Total dataset size: {len(dataset)}")
+    print("Class distribution:")
+    for class_idx, indices in dataset.class_indices.items():
+        print(f"Class {class_idx}: {len(indices)} samples")
+
+    batch_size = 32
+    class_ratios = [0.8, 0.2]  # 80% class 0, 20% class 1
+    balanced_sampler = BalancedBatchSampler(dataset, batch_size, class_ratios)
+
+    print(f"Number of batches: {len(balanced_sampler)}")
+
     dataloader = DataLoader(
         dataset,
-        batch_size=1024,
-        shuffle=True,
+        batch_sampler=balanced_sampler,
         num_workers=16,
         pin_memory=True,
     )
-    image_size_freq = defaultdict(int)
+
     label_frequencies = defaultdict(int)
-    for item in tqdm(dataloader):
+    num_batches_to_check = min(
+        10, len(balanced_sampler)
+    )  # Adjust this to check more or fewer batches
+
+    for i, item in enumerate(
+        tqdm(dataloader, total=num_batches_to_check, desc="Checking batches")
+    ):
+        if i >= num_batches_to_check:
+            break
         for label in item["labels"]["target"]:
             label_frequencies[int(label)] += 1
-        print(label_frequencies)
+
+        print(f"Batch {i+1} label frequencies: {dict(label_frequencies)}")
+        label_frequencies.clear()  # Reset for next batch
+
+    print("Finished checking batches.")
+
+
+if __name__ == "__main__":
+    main()
