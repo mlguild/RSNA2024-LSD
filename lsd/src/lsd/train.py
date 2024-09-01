@@ -1,9 +1,21 @@
+import concurrent.futures
+import io
+import multiprocessing as mp
 import os
-from typing import Callable, Dict, List, Tuple
+import pathlib
+import threading
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from enum import StrEnum
+from queue import Queue
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+import h5py
+import numpy as np
+import pandas as pd
 import PIL
 import PIL.Image
-import numpy as np
 import timm
 import torch
 import torch.nn as nn
@@ -11,24 +23,414 @@ import torch.optim as optim
 import torchvision.transforms as T
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from gate.data import download_kaggle_dataset
 from gate.data.image.classification.imagenet1k import StandardAugmentations
 from rich import print
+from rich.traceback import install
 from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
+    precision_score,
+    recall_score,
+    f1_score,
 )
-from torch.utils.data import DataLoader
+from torch.nn import SyncBatchNorm
+from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 from tqdm.auto import tqdm
 
 import wandb
-from lsd.src.lsd.data import (
-    BalancedBatchSampler,
-    Importance,
-    ISIC2024Dataset,
-    SplitNames,
+
+install()
+
+
+class DatasetNames(StrEnum):
+    ISIC_2024 = "isic-2024-challenge"
+
+
+class SplitNames(StrEnum):
+    TRAIN = "train"
+    VAL = "val"
+    DEVTEST = "devtest"
+    TEST = "test"
+
+
+ISIC2024_COUNT = 401064
+
+METADATA_KEYS = set(
+    [
+        "isic_id",
+        "target",
+        "patient_id",
+        "clin_size_long_diam_mm",
+        "image_type",
+        "tbp_tile_type",
+        "tbp_lv_A",
+        "tbp_lv_Aext",
+        "tbp_lv_B",
+        "tbp_lv_Bext",
+        "tbp_lv_C",
+        "tbp_lv_Cext",
+        "tbp_lv_H",
+        "tbp_lv_Hext",
+        "tbp_lv_L",
+        "tbp_lv_Lext",
+        "tbp_lv_areaMM2",
+        "tbp_lv_area_perim_ratio",
+        "tbp_lv_color_std_mean",
+        "tbp_lv_deltaA",
+        "tbp_lv_deltaB",
+        "tbp_lv_deltaL",
+        "tbp_lv_deltaLB",
+        "tbp_lv_deltaLBnorm",
+        "tbp_lv_eccentricity",
+        "tbp_lv_location",
+        "tbp_lv_location_simple",
+        "tbp_lv_minorAxisMM",
+        "tbp_lv_nevi_confidence",
+        "tbp_lv_norm_border",
+        "tbp_lv_norm_color",
+        "tbp_lv_perimeterMM",
+        "tbp_lv_radial_color_std_max",
+        "tbp_lv_stdL",
+        "tbp_lv_stdLExt",
+        "tbp_lv_symm_2axis",
+        "tbp_lv_symm_2axis_angle",
+        "tbp_lv_x",
+        "tbp_lv_y",
+        "tbp_lv_z",
+        "attribution",
+        "copyright_license",
+        "iddx_full",
+        "iddx_1",
+        "tbp_lv_dnn_lesion_confidence",
+    ]
 )
+
+
+@dataclass
+class MetadataInfo:
+    name: str
+    importance: int
+
+
+class Importance:
+    HIGH = 1
+    MEDIUM = 2
+    LOW = 3
+    VERY_LOW = 4
+
+
+METADATA_KEYS_TO_USE = [
+    MetadataInfo(name="isic_id", importance=Importance.HIGH),
+    MetadataInfo(name="target", importance=Importance.HIGH),
+    MetadataInfo(name="patient_id", importance=Importance.VERY_LOW),
+    MetadataInfo(name="clin_size_long_diam_mm", importance=Importance.MEDIUM),
+    MetadataInfo(name="image_type", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_tile_type", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_A", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_Aext", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_B", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_Bext", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_C", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_Cext", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_H", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_Hext", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_L", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_Lext", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_areaMM2", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_area_perim_ratio", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_color_std_mean", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_deltaA", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_deltaB", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_deltaL", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_deltaLB", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_deltaLBnorm", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_eccentricity", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_location", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_location_simple", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_minorAxisMM", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_nevi_confidence", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_norm_border", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_norm_color", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_perimeterMM", importance=Importance.MEDIUM),
+    MetadataInfo(
+        name="tbp_lv_radial_color_std_max", importance=Importance.MEDIUM
+    ),
+    MetadataInfo(name="tbp_lv_stdL", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_stdLExt", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_symm_2axis", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_symm_2axis_angle", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_x", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_y", importance=Importance.MEDIUM),
+    MetadataInfo(name="tbp_lv_z", importance=Importance.MEDIUM),
+    MetadataInfo(name="attribution", importance=Importance.VERY_LOW),
+    MetadataInfo(name="copyright_license", importance=Importance.VERY_LOW),
+    MetadataInfo(name="iddx_full", importance=Importance.HIGH),
+    MetadataInfo(name="iddx_1", importance=Importance.MEDIUM),
+    MetadataInfo(
+        name="tbp_lv_dnn_lesion_confidence", importance=Importance.HIGH
+    ),
+]
+ISIC_ID = "isic_id"
+
+
+@dataclass
+class DataItem:
+    image: PIL.Image.Image
+    labels: Dict[str, Any]
+
+
+class ISIC2024Dataset(Dataset):
+    def __init__(
+        self,
+        root_dir: str | pathlib.Path,
+        split_name: SplitNames | str = SplitNames.TRAIN,
+        transform: Optional[Callable] = None,
+        importance_level_labels: Importance = Importance.HIGH,
+        return_samples_as_dict: bool = False,
+    ):
+        super().__init__()
+        if isinstance(root_dir, str):
+            root_dir = pathlib.Path(root_dir)
+
+        self.root_dir = root_dir
+        self.transform = transform
+        self.download_extract_data()
+        self.file_count_after_download_and_extract = ISIC2024_COUNT
+        self.return_samples_as_dict = return_samples_as_dict
+
+        self.split_name = split_name
+
+        if split_name in {
+            SplitNames.TRAIN,
+            SplitNames.VAL,
+            SplitNames.DEVTEST,
+        }:
+            target_split_name = "train"
+        elif split_name == SplitNames.TEST:
+            target_split_name = "test"
+        else:
+            raise ValueError(f"Invalid split name: {split_name}")
+
+        self.data = (
+            self.root_dir
+            / DatasetNames.ISIC_2024
+            / f"{target_split_name}-image.hdf5"
+        )
+        self.data = h5py.File(self.data, "r")
+        self.metadata_path = (
+            self.root_dir
+            / DatasetNames.ISIC_2024
+            / f"{target_split_name}-metadata.csv"
+        )
+        self.metadata = pd.read_csv(self.metadata_path)
+
+        if split_name in {
+            SplitNames.TRAIN,
+            SplitNames.VAL,
+            SplitNames.DEVTEST,
+        }:
+            self.metadata = self._split_metadata()
+
+        self.label_keys_to_use = [
+            item.name
+            for item in METADATA_KEYS_TO_USE
+            if item.importance <= importance_level_labels
+        ]
+
+        # Check if 'target' is available in the metadata
+        self.has_targets = "target" in self.metadata.columns
+
+        if self.has_targets:
+            print("Creating class to index mapper...")
+            self.class_indices = self.create_class_indices()
+        else:
+            print("No targets available. Skipping class to index mapping.")
+            self.class_indices = None
+
+    def _split_metadata(self):
+        """Split the training metadata into train, val, and devtest"""
+        train_ratio, val_ratio, devtest_ratio = 0.6, 0.10, 0.30
+        train_end = int(train_ratio * len(self.metadata))
+        val_end = int((train_ratio + val_ratio) * len(self.metadata))
+
+        if self.split_name == SplitNames.TRAIN:
+            return self.metadata[:train_end]
+        elif self.split_name == SplitNames.VAL:
+            return self.metadata[train_end:val_end]
+        elif self.split_name == SplitNames.DEVTEST:
+            return self.metadata[val_end:]
+        else:
+            raise ValueError(
+                f"Invalid split name for splitting metadata: {self.split_name}"
+            )
+
+    def create_class_indices(self):
+        if not self.has_targets:
+            return None
+
+        class_indices = defaultdict(list)
+
+        def process_row(args):
+            idx, row = args
+            return int(row["target"]), idx
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=mp.cpu_count()
+        ) as executor:
+            future_to_row = {
+                executor.submit(process_row, (idx, row)): idx
+                for idx, row in self.metadata.iterrows()
+            }
+
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_row),
+                total=len(self.metadata),
+                desc="Processing rows",
+            ):
+                target, idx = future.result()
+                class_indices[target].append(idx)
+
+        return class_indices
+
+    def download_extract_data(self):
+        download_kaggle_dataset(
+            dataset_name=DatasetNames.ISIC_2024,
+            dataset_path=DatasetNames.ISIC_2024,
+            target_dir_path=self.root_dir,
+            is_competition=True,
+            unzip=True,
+            file_count_after_download_and_extract=4000,
+        )
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        labels = {
+            key: self.metadata.iloc[idx][key]
+            for key in self.label_keys_to_use
+            if key in self.metadata.columns
+        }
+        image_bytes = self.data[labels[ISIC_ID]][()]
+        image = PIL.Image.open(io.BytesIO(image_bytes))
+
+        if self.transform:
+            image = self.transform(image)
+
+        output = DataItem(image=image, labels=labels)
+
+        if self.return_samples_as_dict:
+            output = asdict(output)
+        return output
+
+
+class BalancedBatchSampler(Sampler):
+    def __init__(
+        self,
+        dataset: ISIC2024Dataset,
+        batch_size: int,
+        class_ratios: List[float],
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.class_ratios = class_ratios
+        self.num_classes = len(class_ratios)
+
+        print(
+            f"Initializing BalancedBatchSampler with batch size {batch_size} and class ratios {class_ratios}"
+        )
+
+        if not self.dataset.has_targets:
+            print(
+                "Dataset has no targets. Using random sampling instead of balanced sampling."
+            )
+            self.indices = list(range(len(self.dataset)))
+            self.num_batches_per_epoch = len(self.indices) // batch_size
+            return
+
+        # Create class indices based on the Subset
+        self.class_indices = [[] for _ in range(self.num_classes)]
+        for idx in range(len(self.dataset)):
+            label = self.dataset.metadata.iloc[idx]["target"]
+            self.class_indices[int(label)].append(idx)
+
+        # Print class distribution
+        for class_idx, indices in enumerate(self.class_indices):
+            print(f"Class {class_idx}: {len(indices)} samples")
+
+        # Calculate number of samples for each class in a batch
+        self.samples_per_class = [
+            max(1, int(batch_size * ratio)) for ratio in class_ratios
+        ]
+
+        # Adjust if total samples exceed batch size
+        while sum(self.samples_per_class) > batch_size:
+            max_class = self.samples_per_class.index(
+                max(self.samples_per_class)
+            )
+            self.samples_per_class[max_class] -= 1
+
+        print(f"Samples per class in each batch: {self.samples_per_class}")
+
+        # Calculate the number of batches
+        self.num_batches_per_epoch = min(
+            len(indices) // samples
+            for indices, samples in zip(
+                self.class_indices, self.samples_per_class
+            )
+        )
+        print(f"Number of batches per epoch: {self.num_batches_per_epoch}")
+        self.batch_count = 0
+        # Start off by reshuffling indices
+        self._reshuffle_indices()
+
+    def _reshuffle_indices(self):
+        if not self.dataset.has_targets:
+            np.random.shuffle(self.indices)
+            return
+
+        self.remaining_indices = [
+            np.random.permutation(indices).tolist()
+            for indices in self.class_indices
+        ]
+
+    def __iter__(self) -> Iterator[List[int]]:
+        if not self.dataset.has_targets:
+            for i in range(0, len(self.indices), self.batch_size):
+                yield self.indices[i : i + self.batch_size]
+            return
+
+        while True:  # Infinite loop to keep yielding batches
+            if self.batch_count >= self.num_batches_per_epoch:
+                self._reshuffle_indices()
+                self.batch_count = 0
+
+            batch = []
+            for class_idx, num_samples in enumerate(self.samples_per_class):
+                class_indices = self.remaining_indices[class_idx]
+
+                if len(class_indices) < num_samples:
+                    self.remaining_indices[class_idx] = np.random.permutation(
+                        self.class_indices[class_idx]
+                    ).tolist()
+                    class_indices = self.remaining_indices[class_idx]
+
+                sampled_indices = class_indices[:num_samples]
+                batch.extend(sampled_indices)
+                self.remaining_indices[class_idx] = class_indices[
+                    num_samples:
+                ]  # Remove sampled indices
+
+            np.random.shuffle(batch)
+            yield batch
+            self.batch_count += 1
+
+    def __len__(self) -> int:
+        return self.num_batches_per_epoch
 
 
 class AveragingEnsemble(nn.Module):
@@ -40,6 +442,154 @@ class AveragingEnsemble(nn.Module):
         return torch.stack([model(x).squeeze() for model in self.models]).mean(
             dim=0
         )
+
+
+def compute_pauc_above_80_tpr(y_true, y_pred):
+    fpr, tpr, thresholds = roc_curve(y_true, y_pred)
+
+    # Find the index where TPR crosses 80%
+    idx_80_tpr = np.argmax(tpr >= 0.8)
+
+    # Slice the TPR and FPR from this point onwards
+    tpr_slice = tpr[idx_80_tpr:]
+    fpr_slice = fpr[idx_80_tpr:]
+
+    # Compute pAUC
+    pauc = np.trapz(tpr_slice, fpr_slice)
+
+    # Normalize pAUC to [0, 0.2] range
+    pauc_normalized = pauc / 0.2
+
+    return pauc_normalized
+
+
+import torch.nn.functional as F
+
+
+def compute_metrics(
+    outputs: torch.Tensor, labels: torch.Tensor
+) -> Dict[str, float]:
+    with torch.no_grad():
+        loss = F.binary_cross_entropy_with_logits(outputs, labels).item()
+        probabilities = torch.sigmoid(outputs).cpu().numpy()
+        labels = labels.cpu().numpy()
+        predictions = (probabilities > 0.5).astype(int)
+
+        accuracy = (predictions == labels).mean()
+
+        metrics = {
+            "accuracy": accuracy,
+            "loss": loss,
+        }
+
+        if np.unique(labels).size > 1:
+            # Compute overall metrics
+            auc_roc = roc_auc_score(labels, probabilities)
+            pauc = compute_pauc_above_80_tpr(labels, probabilities)
+            precision, recall, _ = precision_recall_curve(
+                labels, probabilities
+            )
+            f1_scores = f1_score(labels, predictions)
+            ap = average_precision_score(labels, probabilities)
+
+            metrics.update(
+                {
+                    "auc_roc": auc_roc,
+                    "pauc_above_80_tpr": pauc,
+                    "f1_score": f1_scores,
+                    "average_precision": ap,
+                }
+            )
+
+            # Compute per-class metrics
+            for class_id in range(2):  # Assuming binary classification
+                class_mask = labels == class_id
+                class_probabilities = probabilities[class_mask]
+                class_labels = labels[class_mask]
+                class_predictions = predictions[class_mask]
+
+                class_accuracy = (class_predictions == class_labels).mean()
+                class_precision = precision_score(
+                    class_labels, class_predictions, average="binary"
+                )
+                class_recall = recall_score(
+                    class_labels, class_predictions, average="binary"
+                )
+                class_f1 = f1_score(
+                    class_labels, class_predictions, average="binary"
+                )
+
+                metrics.update(
+                    {
+                        f"class_{class_id}_accuracy": class_accuracy,
+                        f"class_{class_id}_precision": class_precision,
+                        f"class_{class_id}_recall": class_recall,
+                        f"class_{class_id}_f1": class_f1,
+                    }
+                )
+
+        return metrics
+
+
+def compute_metrics_and_log(queue, accelerator):
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+
+        outputs, labels, iter_id, mode = item
+
+        metrics = compute_metrics(outputs, labels)
+        metrics[f"{mode}_iter"] = iter_id
+
+        if accelerator.is_local_main_process:
+            wandb.log({f"{mode}_{k}": v for k, v in metrics.items()})
+
+            # Log per-class metrics in a table
+            if "class_0_accuracy" in metrics:
+                table = wandb.Table(
+                    columns=[
+                        "Class",
+                        "Accuracy",
+                        "Precision",
+                        "Recall",
+                        "F1",
+                        "AUC-ROC",
+                    ]
+                )
+                for class_id in range(2):  # Assuming binary classification
+                    table.add_data(
+                        class_id,
+                        metrics[f"class_{class_id}_accuracy"],
+                        metrics[f"class_{class_id}_precision"],
+                        metrics[f"class_{class_id}_recall"],
+                        metrics[f"class_{class_id}_f1"],
+                        metrics.get(f"class_{class_id}_auc_roc", "N/A"),
+                    )
+                wandb.log({f"{mode}_per_class_metrics": table})
+
+        queue.task_done()
+
+
+def log_images_thread(queue, accelerator):
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+
+        results, mode, iter_id = item
+
+        if accelerator.is_local_main_process:
+            images = [
+                wandb.Image(
+                    r["image"],
+                    caption=f"Predicted: {torch.sigmoid(r['output']).item():.4f}, Target: {r['label'].item()}",
+                )
+                for r in results[:100]
+            ]
+            wandb.log({f"{mode}_examples": images, f"{mode}_iter": iter_id})
+
+        queue.task_done()
 
 
 def create_dataloaders(
@@ -147,141 +697,6 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-def compute_pauc_above_80_tpr(y_true, y_pred):
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred)
-
-    # Find the index where TPR crosses 80%
-    idx_80_tpr = np.argmax(tpr >= 0.8)
-
-    # Slice the TPR and FPR from this point onwards
-    tpr_slice = tpr[idx_80_tpr:]
-    fpr_slice = fpr[idx_80_tpr:]
-
-    # Compute pAUC
-    pauc = np.trapz(tpr_slice, fpr_slice)
-
-    # Normalize pAUC to [0, 0.2] range
-    pauc_normalized = pauc / 0.2
-
-    return pauc_normalized
-
-
-def compute_metrics(
-    outputs: torch.Tensor, labels: torch.Tensor
-) -> Dict[str, float]:
-    with torch.no_grad():
-        probabilities = torch.sigmoid(outputs).cpu().numpy()
-        labels = labels.cpu().numpy()
-        predictions = (probabilities > 0.5).astype(int)
-
-        accuracy = (predictions == labels).mean()
-        if np.unique(labels).size > 1:
-            # Compute AUC-ROC
-            auc_roc = roc_auc_score(labels, probabilities)
-
-            # Compute pAUC above 80% TPR
-            pauc = compute_pauc_above_80_tpr(labels, probabilities)
-
-            # Compute precision, recall, and F1 score
-            precision, recall, _ = precision_recall_curve(
-                labels, probabilities
-            )
-            f1_scores = 2 * (precision * recall) / (precision + recall)
-            f1_score = np.max(f1_scores)
-
-            # Compute average precision
-            ap = average_precision_score(labels, probabilities)
-
-            return {
-                "accuracy": accuracy,
-                "auc_roc": auc_roc,
-                "pauc_above_80_tpr": pauc,
-                "f1_score": f1_score,
-                "average_precision": ap,
-            }
-        else:
-            return {"accuracy": accuracy}
-
-
-def step(
-    model: nn.Module, batch: Dict[str, torch.Tensor], criterion: nn.Module
-) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor]:
-    images, labels = batch["image"], batch["labels"]["target"].float()
-    outputs = model(images).squeeze()
-    loss = criterion(outputs, labels)
-    metrics = compute_metrics(outputs.detach().cpu(), labels.cpu())
-    return loss, metrics, outputs, labels
-
-
-def train_step(
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    accelerator: Accelerator,
-) -> Tuple[Dict[str, float], torch.Tensor, torch.Tensor]:
-    model.train()
-    loss, metrics, outputs, labels = step(model, batch, criterion)
-    accelerator.backward(loss)
-    optimizer.step()
-    optimizer.zero_grad()
-    metrics["loss"] = loss.item()
-    return metrics, outputs.detach().cpu(), labels.cpu()
-
-
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
-    accelerator: Accelerator,
-) -> Tuple[Dict[str, float], List[Dict[str, torch.Tensor]]]:
-    model.eval()
-    all_outputs = []
-    all_labels = []
-    all_losses = []
-    all_results = []
-
-    with torch.no_grad():
-        for batch in tqdm(
-            dataloader,
-            desc="Evaluating",
-            disable=not accelerator.is_local_main_process,
-        ):
-            loss, _, outputs, labels = step(model, batch, criterion)
-            all_outputs.append(outputs)
-            all_labels.append(labels)
-            all_losses.append(loss)
-            all_results.extend(
-                [
-                    {
-                        "image": img.cpu(),
-                        "output": out.cpu(),
-                        "label": lbl.cpu(),
-                    }
-                    for img, out, lbl in zip(batch["image"], outputs, labels)
-                ]
-            )
-
-    avg_loss = np.mean([loss.cpu() for loss in all_losses])
-    metrics = compute_metrics(torch.cat(all_outputs), torch.cat(all_labels))
-    metrics["loss"] = avg_loss
-
-    return metrics, all_results
-
-
-def log_images_to_wandb(
-    results: List[Dict[str, torch.Tensor]], mode: str, num_images: int = 100
-):
-    images = [
-        wandb.Image(
-            r["image"],
-            caption=f"Predicted: {torch.sigmoid(r['output']).item():.4f}, Target: {r['label'].item()}",
-        )
-        for r in results[:num_images]
-    ]
-    wandb.log({f"{mode}_examples": images})
-
-
 def save_checkpoint(
     checkpoint_dir: str,
     model: nn.Module,
@@ -323,11 +738,8 @@ def save_checkpoint(
 
 
 def main():
-    from torch.nn import SyncBatchNorm
-
     # Hyperparameters
-    TRAIN_MICRO_BATCH_SIZE = 256
-
+    TRAIN_MICRO_BATCH_SIZE = 128
     EVAL_BATCH_SIZE = 512
     NUM_WORKERS = 16
     LEARNING_RATE = 6e-6
@@ -336,18 +748,17 @@ def main():
     NUM_CLASSES = 1  # Binary classification
     TOP_K_MODELS = 3
     SEED = 42
-    VAL_SPLIT = 0.05
-    TEST_SPLIT = 0.05
     ROOT_DIR = "/mnt/nvme-fast0/datasets/"  # Adjust this to your dataset path
     MODEL_NAME = "convnext_base.fb_in22k_ft_in1k"
     MIXED_PRECISION = "bf16"
     PROJECT_NAME = "isic2024-training"
-    EXPERIMENT_NAME = (
-        "{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
-    )
     IMAGE_SIZE = 224
     WEIGHT_DECAY = 0.0001
     DROPOUT_RATE = 0.5
+    EXPERIMENT_NAME = (
+        f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
+    )
+
     CHECKPOINT_DIR = f"experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
 
     # Initialize accelerator
@@ -373,7 +784,6 @@ def main():
                 "num_classes": NUM_CLASSES,
                 "top_k_models": TOP_K_MODELS,
                 "seed": SEED,
-                "val_split": VAL_SPLIT,
                 "model_name": MODEL_NAME,
                 "mixed_precision": MIXED_PRECISION,
                 "image_size": IMAGE_SIZE,
@@ -416,117 +826,128 @@ def main():
         )
     )
 
+    # Create queues and start threads
+    metric_queue = Queue()
+    image_queue = Queue()
+
+    metric_thread = threading.Thread(
+        target=compute_metrics_and_log, args=(metric_queue, accelerator)
+    )
+    image_thread = threading.Thread(
+        target=log_images_thread, args=(image_queue, accelerator)
+    )
+
+    metric_thread.start()
+    image_thread.start()
+
     accelerator.print("[bold green]Starting training...[/bold green]")
     best_val_pauc = 0
     best_models = []
 
     train_iter = iter(train_loader)
     train_results = []
-    epoch_metrics = {
-        "loss": 0,
-        "accuracy": 0,
-        "auc_roc": 0,
-        "pauc_above_80_tpr": 0,
-        "f1_score": 0,
-        "average_precision": 0,
-    }
-    num_batches = 0
-    with tqdm(total=NUM_TRAIN_ITER, desc="Training") as pbar:
-        for iter_id in range(1, NUM_TRAIN_ITER + 1):
-            try:
-                batch = next(train_iter)
+    for iter_id in tqdm(range(1, NUM_TRAIN_ITER + 1), desc="Training"):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
 
-            except StopIteration:
-                # Log epoch metrics
-                if accelerator.is_local_main_process:
-                    wandb.log(
-                        {
-                            f"epoch_{k}": v / num_batches
-                            for k, v in epoch_metrics.items()
-                        }
+        model.train()
+        images, labels = batch["image"], batch["labels"]["target"].float()
+        outputs = model(images).squeeze()
+        loss = criterion(outputs, labels)
+
+        accelerator.backward(loss)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Add metrics computation to queue
+        metric_queue.put(
+            (outputs.detach().cpu(), labels.cpu(), iter_id, "train")
+        )
+
+        if accelerator.is_local_main_process:
+            train_results.extend(
+                [
+                    {
+                        "image": img.cpu(),
+                        "output": out.cpu(),
+                        "label": lbl.cpu(),
+                    }
+                    for img, out, lbl in zip(batch["image"], outputs, labels)
+                ]
+            )
+            if len(train_results) >= 100:
+                image_queue.put((train_results, "train", iter_id))
+                train_results = []
+
+        if iter_id % VALIDATE_EVERY == 0:
+            model.eval()
+            val_outputs = []
+            val_labels = []
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_images, val_targets = (
+                        val_batch["image"],
+                        val_batch["labels"]["target"].float(),
                     )
-                epoch_metrics = {
-                    "loss": 0,
-                    "accuracy": 0,
-                    "auc_roc": 0,
-                    "pauc_above_80_tpr": 0,
-                    "f1_score": 0,
-                    "average_precision": 0,
-                }
-                num_batches = 0
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
+                    val_out = model(val_images).squeeze()
+                    val_outputs.append(val_out)
+                    val_labels.append(val_targets)
 
-            metrics, outputs, labels = train_step(
-                model, batch, criterion, optimizer, accelerator
+            val_outputs = torch.cat(val_outputs)
+            val_labels = torch.cat(val_labels)
+
+            # Add validation metrics computation to queue
+            metric_queue.put(
+                (val_outputs.cpu(), val_labels.cpu(), iter_id, "val")
             )
 
-            # Update epoch metrics
-            for k, v in metrics.items():
-                epoch_metrics[k] += v
-            num_batches += 1
-
             if accelerator.is_local_main_process:
-                wandb.log({f"iter_{k}": v for k, v in metrics.items()})
-
-                train_results.extend(
-                    [
-                        {
-                            "image": img,
-                            "output": out,
-                            "label": lbl,
-                        }
-                        for img, out, lbl in zip(
-                            batch["image"], outputs, labels
-                        )
-                    ]
-                )
-                if len(train_results) >= 100:
-                    log_images_to_wandb(train_results, "train")
-                    train_results = []
-
-            if accelerator.is_local_main_process:
-                pbar.update(1)
-                pbar.set_description(f"loss: {metrics['loss']}")
-
-            if iter_id % VALIDATE_EVERY == 0:
-                val_metrics, val_results = evaluate(
-                    model, val_loader, criterion, accelerator
-                )
-
-                if accelerator.is_local_main_process:
-                    wandb.log({f"val_{k}": v for k, v in val_metrics.items()})
-                    log_images_to_wandb(val_results, "val")
-                    accelerator.print(
-                        f"[cyan]Iteration {iter_id}:[/cyan] {val_metrics}"
+                val_results = [
+                    {
+                        "image": img,
+                        "output": out,
+                        "label": lbl,
+                    }
+                    for img, out, lbl in zip(
+                        val_batch["image"], val_outputs, val_labels
                     )
+                ]
+                image_queue.put((val_results, "val", iter_id))
 
-                is_best = val_metrics["pauc_above_80_tpr"] > best_val_pauc
-                save_checkpoint(
-                    CHECKPOINT_DIR,
-                    model,
-                    optimizer,
-                    iter_id // len(train_loader) + 1,
-                    iter_id,
-                    val_metrics,
-                    accelerator,
-                    is_best,
-                )
-
-                if is_best:
-                    best_val_pauc = val_metrics["pauc_above_80_tpr"]
-
-                best_models.append((val_metrics["pauc_above_80_tpr"], iter_id))
-                best_models.sort(reverse=True)
-                best_models = best_models[:TOP_K_MODELS]
+            # Save checkpoint
+            save_checkpoint(
+                CHECKPOINT_DIR,
+                model,
+                optimizer,
+                iter_id // len(train_loader) + 1,
+                iter_id,
+                {"iter": iter_id},  # We'll update metrics later
+                accelerator,
+                is_best=False,  # We'll determine this after getting metrics
+            )
 
     accelerator.print(
         "[bold green]Training completed. Creating ensemble...[/bold green]"
     )
+
+    # Stop the threads
+    metric_queue.put(None)
+    image_queue.put(None)
+    metric_thread.join()
+    image_thread.join()
+
+    # Load the best checkpoints and create an ensemble
+    best_checkpoints = sorted(os.listdir(CHECKPOINT_DIR))[-TOP_K_MODELS:]
     ensemble_models = []
-    for _, iter_id in best_models:
+    for checkpoint_name in best_checkpoints:
+        checkpoint_path = os.path.join(
+            CHECKPOINT_DIR, checkpoint_name, "checkpoint_latest.pth"
+        )
         checkpoint = torch.load(
-            f"{CHECKPOINT_DIR}/iter_{iter_id}/checkpoint_{iter_id}.pth"
+            checkpoint_path, map_location=accelerator.device
         )
         model = timm.create_model(
             MODEL_NAME,
@@ -541,19 +962,68 @@ def main():
     ensemble = accelerator.prepare(ensemble)
 
     accelerator.print("[bold green]Testing ensemble...[/bold green]")
-    test_metrics, test_results = evaluate(
-        ensemble, test_loader, criterion, accelerator
-    )
+    ensemble.eval()
+    test_outputs = []
+    test_labels = []
+    with torch.no_grad():
+        for test_batch in tqdm(test_loader, desc="Testing"):
+            test_images, test_targets = (
+                test_batch["image"],
+                test_batch["labels"]["target"].float(),
+            )
+            test_out = ensemble(test_images).squeeze()
+            test_outputs.append(test_out)
+            test_labels.append(test_targets)
+
+    test_outputs = torch.cat(test_outputs)
+    test_labels = torch.cat(test_labels)
+
+    # Compute and log test metrics
+    test_metrics = compute_metrics(test_outputs.cpu(), test_labels.cpu())
 
     if accelerator.is_local_main_process:
         accelerator.print(
             f"[bold cyan]Ensemble Test Results:[/bold cyan] {test_metrics}"
         )
-
         wandb.log({"ensemble_test_" + k: v for k, v in test_metrics.items()})
-        log_images_to_wandb(
-            test_results, "test", num_images=len(test_results)
-        )  # Log all test cases
+
+        # Log per-class metrics for ensemble test results
+        if "class_0_accuracy" in test_metrics:
+            table = wandb.Table(
+                columns=[
+                    "Class",
+                    "Accuracy",
+                    "Precision",
+                    "Recall",
+                    "F1",
+                    "AUC-ROC",
+                ]
+            )
+            for class_id in range(2):  # Assuming binary classification
+                table.add_data(
+                    class_id,
+                    test_metrics[f"class_{class_id}_accuracy"],
+                    test_metrics[f"class_{class_id}_precision"],
+                    test_metrics[f"class_{class_id}_recall"],
+                    test_metrics[f"class_{class_id}_f1"],
+                    test_metrics.get(f"class_{class_id}_auc_roc", "N/A"),
+                )
+            wandb.log({"ensemble_test_per_class_metrics": table})
+
+        # Log test images
+        test_results = [
+            {
+                "image": img,
+                "output": out,
+                "label": lbl,
+            }
+            for img, out, lbl in zip(
+                test_batch["image"], test_outputs, test_labels
+            )
+        ]
+        log_images_thread(
+            [(test_results, "test", NUM_TRAIN_ITER)], accelerator
+        )
 
         wandb.finish()
 
