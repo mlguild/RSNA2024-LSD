@@ -230,7 +230,7 @@ class ISIC2024Dataset(Dataset):
 
     def _split_metadata(self):
         """Split the training metadata into train, val, and devtest"""
-        train_ratio, val_ratio, devtest_ratio = 0.9, 0.05, 0.05
+        train_ratio, val_ratio, devtest_ratio = 0.5, 0.10, 0.40
         train_end = int(train_ratio * len(self.metadata))
         val_end = int((train_ratio + val_ratio) * len(self.metadata))
 

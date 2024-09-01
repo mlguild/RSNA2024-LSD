@@ -283,6 +283,7 @@ def log_images_to_wandb(
 
 
 def save_checkpoint(
+    checkpoint_dir: str,
     model: nn.Module,
     optimizer: optim.Optimizer,
     epoch: int,
@@ -292,7 +293,7 @@ def save_checkpoint(
     is_best: bool = False,
 ) -> None:
     if accelerator.is_local_main_process:
-        checkpoint_dir = f"checkpoints/iter_{iter_id}"
+        checkpoint_dir = f"{checkpoint_dir}/iter_{iter_id}"
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         checkpoint = {
@@ -325,7 +326,7 @@ def main():
     from torch.nn import SyncBatchNorm
 
     # Hyperparameters
-    TRAIN_MICRO_BATCH_SIZE = 64
+    TRAIN_MICRO_BATCH_SIZE = 256
 
     EVAL_BATCH_SIZE = 512
     NUM_WORKERS = 16
@@ -338,11 +339,16 @@ def main():
     VAL_SPLIT = 0.05
     TEST_SPLIT = 0.05
     ROOT_DIR = "/mnt/nvme-fast0/datasets/"  # Adjust this to your dataset path
-    MODEL_NAME = "convnextv2_base"
+    MODEL_NAME = "convnext_base.fb_in22k_ft_in1k"
     MIXED_PRECISION = "bf16"
     PROJECT_NAME = "isic2024-training"
+    EXPERIMENT_NAME = (
+        "{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
+    )
     IMAGE_SIZE = 224
     WEIGHT_DECAY = 0.0001
+    DROPOUT_RATE = 0.5
+    CHECKPOINT_DIR = f"experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -377,7 +383,10 @@ def main():
     accelerator.print("[bold green]Creating dataloaders...[/bold green]")
 
     model = timm.create_model(
-        MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES
+        MODEL_NAME,
+        pretrained=True,
+        num_classes=NUM_CLASSES,
+        drop_rate=DROPOUT_RATE,
     )
 
     data_cfg = timm.data.resolve_data_config(model.pretrained_cfg)
@@ -494,6 +503,7 @@ def main():
 
                 is_best = val_metrics["pauc_above_80_tpr"] > best_val_pauc
                 save_checkpoint(
+                    CHECKPOINT_DIR,
                     model,
                     optimizer,
                     iter_id // len(train_loader) + 1,
@@ -516,10 +526,13 @@ def main():
     ensemble_models = []
     for _, iter_id in best_models:
         checkpoint = torch.load(
-            f"checkpoints/iter_{iter_id}/checkpoint_{iter_id}.pth"
+            f"{CHECKPOINT_DIR}/iter_{iter_id}/checkpoint_{iter_id}.pth"
         )
         model = timm.create_model(
-            MODEL_NAME, pretrained=False, num_classes=NUM_CLASSES
+            MODEL_NAME,
+            pretrained=False,
+            num_classes=NUM_CLASSES,
+            drop_rate=DROPOUT_RATE,
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         ensemble_models.append(model)
