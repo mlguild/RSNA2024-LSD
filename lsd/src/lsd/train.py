@@ -379,7 +379,7 @@ def train_epoch(
                 iter_id=iter_id,
             )
             save_checkpoint(
-                checkpoint_dir=config.get_checkpoint_dir(),
+                checkpoint_dir=config.CHECKPOINT_DIR,
                 model=model,
                 optimizer=optimizer,
                 epoch=iter_id // len(train_loader) + 1,
@@ -528,11 +528,13 @@ class Config:
     DROPOUT_RATE: float = 0.5
     LOG_EVERY: int = 100
 
-    def get_experiment_name(self):
-        return f"{self.MODEL_NAME}_{self.LEARNING_RATE}_{self.WEIGHT_DECAY}_{self.DROPOUT_RATE}_{self.SEED}"
+    EXPERIMENT_NAME = (
+        f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
+    )
 
-    def get_checkpoint_dir(self):
-        return f"/mnt/nvme-fast0/experiments/{self.PROJECT_NAME}/{self.get_experiment_name()}"
+    CHECKPOINT_DIR = (
+        f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
+    )
 
 
 def main(config: str | pathlib.Path | Config):
@@ -556,7 +558,7 @@ def main(config: str | pathlib.Path | Config):
     initialize_wandb(config=config, accelerator=accelerator)
 
     latest_checkpoint_path = find_latest_checkpoint(
-        checkpoint_dir=config.get_checkpoint_dir()
+        checkpoint_dir=config.CHECKPOINT_DIR
     )
     model = create_model(
         config=config, pretrained=(latest_checkpoint_path is None)
@@ -614,7 +616,7 @@ def main(config: str | pathlib.Path | Config):
     )
     ensemble = create_ensemble(
         config=config,
-        checkpoint_dir=config.get_checkpoint_dir(),
+        checkpoint_dir=config.CHECKPOINT_DIR,
         accelerator=accelerator,
     )
     ensemble = accelerator.prepare(ensemble)

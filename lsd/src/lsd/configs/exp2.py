@@ -17,11 +17,11 @@ DROPOUT_RATE = 0.0
 LOG_EVERY = 100
 
 
-def get_experiment_name():
-    return f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
+EXPERIMENT_NAME = (
+    f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
+)
 
 
-def get_checkpoint_dir():
-    return (
-        f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{get_experiment_name()}"
-    )
+CHECKPOINT_DIR = (
+    f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
+)
