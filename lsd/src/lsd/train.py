@@ -527,12 +527,10 @@ class Config:
     WEIGHT_DECAY: float = 0.0001
     DROPOUT_RATE: float = 0.5
     LOG_EVERY: int = 100
-
-    EXPERIMENT_NAME = (
+    EXPERIMENT_NAME: str = (
         f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
     )
-
-    CHECKPOINT_DIR = (
+    CHECKPOINT_DIR: str = (
         f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
     )
 
@@ -543,7 +541,6 @@ def main(config: str | pathlib.Path | Config):
         sys.path.append(str(config_path.parent.parent))
         module_name = f"{config_path.parent.name}.{config_path.stem}"
         config = importlib.import_module(name=module_name)
-        print(config)
         config = Config(
             **{k: v for k, v in vars(config).items() if k.isupper()}
         )
