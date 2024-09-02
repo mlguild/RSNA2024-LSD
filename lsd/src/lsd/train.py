@@ -1,6 +1,11 @@
+from dataclasses import dataclass
+import importlib
 import os
+import pathlib
+import sys
 from typing import Callable, Dict, List, Tuple
 
+import fire
 import numpy as np
 import PIL
 import PIL.Image
@@ -298,113 +303,62 @@ def set_dropout_rate(model: nn.Module, dropout_rate: float) -> nn.Module:
     return model
 
 
-def main():
-    # Hyperparameters
-    TRAIN_MICRO_BATCH_SIZE = 128
-    EVAL_BATCH_SIZE = 512
-    NUM_WORKERS = 16
-    LEARNING_RATE = 6e-6
-    NUM_TRAIN_ITER = 10000
-    VALIDATE_EVERY = 100
-    NUM_CLASSES = 1  # Binary classification
-    TOP_K_MODELS = 3
-    SEED = 42
-    ROOT_DIR = "/mnt/nvme-fast0/datasets/"  # Adjust this to your dataset path
-    MODEL_NAME = "convnext_base.fb_in22k_ft_in1k"
-    MIXED_PRECISION = "bf16"
-    PROJECT_NAME = "isic2024-training"
-    IMAGE_SIZE = 224
-    WEIGHT_DECAY = 0.0001
-    DROPOUT_RATE = 0.5
-    EXPERIMENT_NAME = (
-        f"{MODEL_NAME}_{LEARNING_RATE}_{WEIGHT_DECAY}_{DROPOUT_RATE}_{SEED}"
-    )
-
-    CHECKPOINT_DIR = (
-        f"/mnt/nvme-fast0/experiments/{PROJECT_NAME}/{EXPERIMENT_NAME}"
-    )
-    LOG_EVERY = 100  # Log every 10 steps
-
-    # Initialize accelerator
-    accelerator = Accelerator(
-        mixed_precision=MIXED_PRECISION,
-        gradient_accumulation_steps=1,
-    )
-
-    # Set seeds for reproducibility
-    set_seed(SEED)
-    accelerator.print(f"Random seed set to {SEED}")
-
-    # Initialize wandb (only on main process)
+def initialize_wandb(config, accelerator):
     if accelerator.is_local_main_process:
         wandb.init(
-            project=PROJECT_NAME,
-            config={
-                "train_batch_size": TRAIN_MICRO_BATCH_SIZE,
-                "eval_batch_size": EVAL_BATCH_SIZE,
-                "learning_rate": LEARNING_RATE,
-                "num_train_iter": NUM_TRAIN_ITER,
-                "validate_every": VALIDATE_EVERY,
-                "num_classes": NUM_CLASSES,
-                "top_k_models": TOP_K_MODELS,
-                "seed": SEED,
-                "model_name": MODEL_NAME,
-                "mixed_precision": MIXED_PRECISION,
-                "image_size": IMAGE_SIZE,
-            },
+            project=config.PROJECT_NAME,
+            config={k: v for k, v in vars(config).items() if k.isupper()},
         )
 
-    accelerator.print("[bold green]Creating dataloaders...[/bold green]")
 
+def load_checkpoint(checkpoint_path, model, optimizer):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_iter = checkpoint["iter_id"] + 1
+    return model, optimizer, start_iter
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    if os.path.exists(checkpoint_dir):
+        checkpoints = [
+            d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+        ]
+        if checkpoints:
+            latest_checkpoint = max(
+                checkpoints, key=lambda x: int(x.split("_")[1])
+            )
+            return os.path.join(
+                checkpoint_dir, latest_checkpoint, "checkpoint_latest.pth"
+            )
+    return None
+
+
+def create_model(config, pretrained):
     model = timm.create_model(
-        MODEL_NAME,
-        pretrained=True,
-        num_classes=NUM_CLASSES,
-        drop_rate=DROPOUT_RATE,
+        config.MODEL_NAME,
+        pretrained=pretrained,
+        num_classes=config.NUM_CLASSES,
+        drop_rate=config.DROPOUT_RATE,
     )
-    model = set_dropout_rate(model, DROPOUT_RATE)
+    return set_dropout_rate(model, config.DROPOUT_RATE)
 
-    data_cfg = timm.data.resolve_data_config(model.pretrained_cfg)
 
-    print(model)
-
-    train_loader, val_loader, test_loader = create_dataloaders(
-        TRAIN_MICRO_BATCH_SIZE,
-        EVAL_BATCH_SIZE,
-        NUM_WORKERS,
-        ROOT_DIR,
-        IMAGE_SIZE,
-        SEED,
-        data_cfg,
-    )
-
-    accelerator.print("[bold green]Loading model...[/bold green]")
-
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-    )
-
-    model, optimizer, train_loader, val_loader, test_loader = (
-        accelerator.prepare(
-            model, optimizer, train_loader, val_loader, test_loader
-        )
-    )
-
+def train_epoch(
+    model, train_loader, val_loader, optimizer, criterion, accelerator, config
+):
+    model.train()
     metric_cache = []
     image_cache = []
 
-    accelerator.print("[bold green]Starting training...[/bold green]")
-
     train_iter = iter(train_loader)
-    for iter_id in tqdm(range(1, NUM_TRAIN_ITER + 1), desc="Training"):
+    for iter_id in tqdm(range(1, config.NUM_TRAIN_ITER + 1), desc="Training"):
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-        model.train()
         images, labels = batch["image"], batch["labels"]["target"].float()
         outputs = model(images).squeeze()
         loss = criterion(outputs, labels)
@@ -413,25 +367,18 @@ def main():
         optimizer.step()
         optimizer.zero_grad()
 
-        # Compute metrics
         metrics = compute_metrics(outputs.detach().cpu(), labels.cpu())
         metrics["train_iter"] = iter_id
         metric_cache.append(metrics)
 
-        # Cache images
         image_cache.extend(
             [
-                {
-                    "image": img.cpu(),
-                    "output": out.cpu(),
-                    "label": lbl.cpu(),
-                }
+                {"image": img.cpu(), "output": out.cpu(), "label": lbl.cpu()}
                 for img, out, lbl in zip(batch["image"], outputs, labels)
             ]
         )
 
-        # Log metrics and images every LOG_EVERY steps
-        if iter_id % LOG_EVERY == 0:
+        if iter_id % config.LOG_EVERY == 0:
             log_metrics_and_images(
                 {
                     k: np.mean([m[k] for m in metric_cache])
@@ -445,85 +392,74 @@ def main():
             metric_cache = []
             image_cache = []
 
-        if iter_id % VALIDATE_EVERY == 0:
-            model.eval()
-            val_outputs = []
-            val_labels = []
-            with torch.no_grad():
-                for val_batch in tqdm(val_loader):
-                    val_images, val_targets = (
-                        val_batch["image"],
-                        val_batch["labels"]["target"].float(),
-                    )
-                    val_out = model(val_images).squeeze()
-                    val_outputs.append(val_out.cpu())
-                    val_labels.append(val_targets.cpu())
-
-            val_outputs = torch.cat(val_outputs)
-            val_labels = torch.cat(val_labels)
-
-            # Compute and log validation metrics
-            val_metrics = compute_metrics(val_outputs.cpu(), val_labels.cpu())
-            val_metrics["val_iter"] = iter_id
-            log_metrics_and_images(
-                val_metrics,
-                [
-                    {
-                        "image": img.cpu(),
-                        "output": out.cpu(),
-                        "label": lbl.cpu(),
-                    }
-                    for img, out, lbl in zip(
-                        val_batch["image"], val_outputs, val_labels
-                    )
-                ],
-                "val",
-                iter_id,
-                accelerator,
+        if iter_id % config.VALIDATE_EVERY == 0:
+            validate(
+                model, val_loader, criterion, accelerator, config, iter_id
             )
-
-            # Save checkpoint
             save_checkpoint(
-                CHECKPOINT_DIR,
+                config.get_checkpoint_dir(),
                 model,
                 optimizer,
                 iter_id // len(train_loader) + 1,
                 iter_id,
-                val_metrics,
                 accelerator,
-                is_best=False,  # We'll determine this after getting metrics
+                is_best=False,
             )
 
-    accelerator.print(
-        "[bold green]Training completed. Creating ensemble...[/bold green]"
+
+def validate(model, val_loader, accelerator, iter_id):
+    model.eval()
+    val_outputs, val_labels = [], []
+    with torch.no_grad():
+        for val_batch in tqdm(val_loader, desc="Validating"):
+            val_images, val_targets = (
+                val_batch["image"],
+                val_batch["labels"]["target"].float(),
+            )
+            val_out = model(val_images).squeeze()
+            val_outputs.append(val_out.cpu())
+            val_labels.append(val_targets.cpu())
+
+    val_outputs = torch.cat(val_outputs)
+    val_labels = torch.cat(val_labels)
+
+    val_metrics = compute_metrics(val_outputs, val_labels)
+    val_metrics["val_iter"] = iter_id
+    log_metrics_and_images(
+        val_metrics,
+        [
+            {"image": img.cpu(), "output": out.cpu(), "label": lbl.cpu()}
+            for img, out, lbl in zip(
+                val_batch["image"], val_outputs, val_labels
+            )
+        ],
+        "val",
+        iter_id,
+        accelerator,
     )
 
-    # Load the best checkpoints and create an ensemble
-    best_checkpoints = sorted(os.listdir(CHECKPOINT_DIR))[-TOP_K_MODELS:]
+
+def create_ensemble(config, checkpoint_dir, accelerator):
+    best_checkpoints = sorted(os.listdir(checkpoint_dir))[
+        -config.TOP_K_MODELS :
+    ]
     ensemble_models = []
     for checkpoint_name in best_checkpoints:
         checkpoint_path = os.path.join(
-            CHECKPOINT_DIR, checkpoint_name, "checkpoint_latest.pth"
+            checkpoint_dir, checkpoint_name, "checkpoint_latest.pth"
         )
         checkpoint = torch.load(
             checkpoint_path, map_location=accelerator.device
         )
-        model = timm.create_model(
-            MODEL_NAME,
-            pretrained=False,
-            num_classes=NUM_CLASSES,
-            drop_rate=DROPOUT_RATE,
-        )
+        model = create_model(config, pretrained=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         ensemble_models.append(model)
+    return AveragingEnsemble(ensemble_models)
 
-    ensemble = AveragingEnsemble(ensemble_models)
-    ensemble = accelerator.prepare(ensemble)
 
-    accelerator.print("[bold green]Testing ensemble...[/bold green]")
+def test_ensemble(ensemble, test_loader):
     ensemble.eval()
-    test_outputs = []
-    test_labels = []
+    test_outputs, test_labels = [], []
     with torch.no_grad():
         for test_batch in tqdm(test_loader, desc="Testing"):
             test_images, test_targets = (
@@ -533,20 +469,18 @@ def main():
             test_out = ensemble(test_images).squeeze()
             test_outputs.append(test_out)
             test_labels.append(test_targets)
+    return torch.cat(test_outputs), torch.cat(test_labels)
 
-    test_outputs = torch.cat(test_outputs)
-    test_labels = torch.cat(test_labels)
 
-    # Compute and log test metrics
-    test_metrics = compute_metrics(test_outputs.cpu(), test_labels.cpu())
-
+def log_test_results(
+    test_metrics, test_batch, test_outputs, test_labels, accelerator, config
+):
     if accelerator.is_local_main_process:
         accelerator.print(
             f"[bold cyan]Ensemble Test Results:[/bold cyan] {test_metrics}"
         )
         wandb.log({"ensemble_test_" + k: v for k, v in test_metrics.items()})
 
-        # Log per-class metrics for ensemble test results
         if "class_0_accuracy" in test_metrics:
             table = wandb.Table(
                 columns=[
@@ -562,9 +496,9 @@ def main():
                 table.add_data(
                     class_id,
                     test_metrics[f"class_{class_id}_accuracy"],
-                    test_metrics[f"class_{class_id}_precision"],
-                    test_metrics[f"class_{class_id}_recall"],
-                    test_metrics[f"class_{class_id}_f1"],
+                    test_metrics.get(f"class_{class_id}_precision", "N/A"),
+                    test_metrics.get(f"class_{class_id}_recall", "N/A"),
+                    test_metrics.get(f"class_{class_id}_f1", "N/A"),
                     test_metrics.get(f"class_{class_id}_auc_roc", "N/A"),
                 )
             wandb.log({"ensemble_test_per_class_metrics": table})
@@ -572,24 +506,147 @@ def main():
         log_metrics_and_images(
             test_metrics,
             [
-                {
-                    "image": img.cpu(),
-                    "output": out.cpu(),
-                    "label": lbl.cpu(),
-                }
+                {"image": img.cpu(), "output": out.cpu(), "label": lbl.cpu()}
                 for img, out, lbl in zip(
                     test_batch["image"], test_outputs, test_labels
                 )
             ],
-            "val",
-            iter_id,
+            "test",
+            config.NUM_TRAIN_ITER,
             accelerator,
         )
 
+
+@dataclass
+class Config:
+    TRAIN_MICRO_BATCH_SIZE: int = 128
+    EVAL_BATCH_SIZE: int = 512
+    NUM_WORKERS: int = 16
+    LEARNING_RATE: float = 6e-6
+    NUM_TRAIN_ITER: int = 10000
+    VALIDATE_EVERY: int = 100
+    NUM_CLASSES: int = 1
+    TOP_K_MODELS: int = 3
+    SEED: int = 42
+    ROOT_DIR: str = "/mnt/nvme-fast0/datasets/"
+    MODEL_NAME: str = "convnext_base.fb_in22k_ft_in1k"
+    MIXED_PRECISION: str = "bf16"
+    PROJECT_NAME: str = "isic2024-training"
+    IMAGE_SIZE: int = 224
+    WEIGHT_DECAY: float = 0.0001
+    DROPOUT_RATE: float = 0.5
+    LOG_EVERY: int = 100
+
+    def get_experiment_name(self):
+        return f"{self.MODEL_NAME}_{self.LEARNING_RATE}_{self.WEIGHT_DECAY}_{self.DROPOUT_RATE}_{self.SEED}"
+
+    def get_checkpoint_dir(self):
+        return f"/mnt/nvme-fast0/experiments/{self.PROJECT_NAME}/{self.get_experiment_name()}"
+
+
+def main(config: str | pathlib.Path | Config):
+
+    if isinstance(config, (str, pathlib.Path)):
+        config_path = pathlib.Path(config).resolve()
+
+        # Add the parent directory of the config file to sys.path
+        sys.path.append(str(config_path.parent.parent))
+
+        # Import the config module
+        module_name = f"{config_path.parent.name}.{config_path.stem}"
+        config = importlib.import_module(module_name)
+
+        # Create a Config instance with values from the imported module
+        config = Config(
+            **{k: v for k, v in vars(config).items() if k.isupper()}
+        )
+    print(f"Config being used is {config}")
+
+    accelerator = Accelerator(
+        mixed_precision=config.MIXED_PRECISION, gradient_accumulation_steps=1
+    )
+    set_seed(config.SEED)
+    accelerator.print(f"Random seed set to {config.SEED}")
+
+    initialize_wandb(config, accelerator)
+
+    latest_checkpoint_path = find_latest_checkpoint(
+        config.get_checkpoint_dir()
+    )
+    model = create_model(config, pretrained=(latest_checkpoint_path is None))
+    model_transforms = timm.data.resolve_data_config(model.pretrained_cfg)
+    print(model, model_transforms)
+
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_batch_size=config.TRAIN_MICRO_BATCH_SIZE,
+        eval_batch_size=config.EVAL_BATCH_SIZE,
+        num_workers=config.NUM_WORKERS,
+        image_size=config.IMAGE_SIZE,
+        root_dir=config.ROOT_DIR,
+        seed=config.SEED,
+        model_transform_config=model_transforms,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+
+    start_iter = 1
+    if latest_checkpoint_path:
+        model, optimizer, start_iter = load_checkpoint(
+            latest_checkpoint_path, model, optimizer
+        )
+        accelerator.print(
+            f"[bold green]Resuming from iteration {start_iter}[/bold green]"
+        )
+
+    model, optimizer, train_loader, val_loader, test_loader = (
+        accelerator.prepare(
+            model, optimizer, train_loader, val_loader, test_loader
+        )
+    )
+
+    accelerator.print("[bold green]Starting/Resuming training...[/bold green]")
+    train_epoch(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        criterion,
+        accelerator,
+        config,
+    )
+
+    accelerator.print(
+        "[bold green]Training completed. Creating ensemble...[/bold green]"
+    )
+    ensemble = create_ensemble(
+        config, config.get_checkpoint_dir(), accelerator
+    )
+    ensemble = accelerator.prepare(ensemble)
+
+    accelerator.print("[bold green]Testing ensemble...[/bold green]")
+    test_outputs, test_labels = test_ensemble(
+        ensemble, test_loader, accelerator
+    )
+    test_metrics = compute_metrics(test_outputs.cpu(), test_labels.cpu())
+
+    log_test_results(
+        test_metrics,
+        test_loader.dataset[0],
+        test_outputs,
+        test_labels,
+        accelerator,
+        config,
+    )
+
+    if accelerator.is_local_main_process:
         wandb.finish()
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
